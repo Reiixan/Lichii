@@ -49,7 +49,6 @@ add_library(
     dkb_cpu_trace.h
     nx2_sampler.cpp
     nx2_sampler.h
-    nx2_movie_clock.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h

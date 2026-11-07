@@ -11,7 +11,6 @@
 #include "audio_core/renderer/command/resample/resample.h"
 #include "common/fixed_point.h"
 #include "common/logging.h"
-#include "common/nx2_movie_clock.h"
 #include "common/scratch_buffer.h"
 #include "core/guest_memory.h"
 #include "core/memory.h"
@@ -339,10 +338,6 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
             }
 
             played_sample_count += samples_decoded;
-            if (Common::Nx2MovieClock::Enabled()) {
-                Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().voice_samples,
-                                           static_cast<u64>(samples_decoded));
-            }
             samples_read += samples_decoded;
             temp_buffer_pos += samples_decoded;
             offset += samples_decoded;

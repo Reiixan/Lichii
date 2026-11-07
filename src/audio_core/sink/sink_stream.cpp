@@ -18,7 +18,6 @@
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
 #include "common/fixed_point.h"
-#include "common/nx2_movie_clock.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -250,13 +249,6 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     }
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
-
-    if (type == StreamType::Render && Common::Nx2MovieClock::Enabled()) {
-        auto& clock = Common::Nx2MovieClock::Get();
-        const size_t index = !name.empty() && name.back() == '1' ? 1 : 0;
-        Common::Nx2MovieClock::Add(clock.sink_frames[index], num_frames);
-        Common::Nx2MovieClock::Add(clock.sink_padded[index], num_frames - actual_frames_written);
-    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;
