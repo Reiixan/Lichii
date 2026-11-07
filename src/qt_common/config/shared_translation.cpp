@@ -165,17 +165,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
               "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
-              "download button below.\nCurrently requires Fire Emblem: Fortune's Weave and "
+              "download button below.\nFire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nTakes effect when a game starts."));
+              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
     INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution).\nTakes effect "
-              "when the game starts."));
+              "without the network (faster; pairs well with a higher resolution). Has no effect while "
+              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -297,6 +298,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, tensor_programs, tr("Switch 2 tensor programs:"),
+           tr("Switch 2 games run neural networks (Ocarina of Time's upscaler and movie "
+              "enhancement) on tensor cores. Native emulates them in software or on Vulkan "
+              "cooperative matrices; Stand-in skips the network and draws a plain upscale of "
+              "its input. Auto emulates them only where the GPU has cooperative matrices (and "
+              "always for Donkey Kong Bananza), which makes them far faster on Macs and on GPUs "
+              "without that extension. Takes effect on the next game boot."));
     INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
            tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
               "does when its graphics pipeline is still building.\n"
@@ -696,6 +704,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(ConsoleMode, Docked, tr("Docked")),
                               PAIR(ConsoleMode, Handheld, tr("Handheld")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::TensorPrograms>::Index(),
+                          {
+                              PAIR(TensorPrograms, Auto, tr("Auto")),
+                              PAIR(TensorPrograms, Native, tr("Native")),
+                              PAIR(TensorPrograms, Standin, tr("Stand-in")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::NativeAsyncDraws>::Index(),
                           {

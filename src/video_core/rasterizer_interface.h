@@ -235,6 +235,11 @@ public:
         return false;
     }
 
+    /// Whether native tensor programs (matrix multiplies) should be emulated in software here.
+    [[nodiscard]] virtual bool EmulatesNativeTensorPrograms() const {
+        return true;
+    }
+
     /// Whether NVIDIA DLSS (the "Use NVIDIA DLSS" setting) would draw a game's DLSS evaluation.
     [[nodiscard]] virtual bool UsesNvidiaDlss() const {
         return false;
@@ -253,7 +258,7 @@ public:
     }
 
     /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
-    /// this backend cannot bypass it.
+    /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
     [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
         return nullptr;
     }

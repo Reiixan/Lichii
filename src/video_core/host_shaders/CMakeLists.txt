@@ -19,6 +19,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_srgb_to_linear.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_square.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_2d.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth.frag
@@ -101,6 +102,13 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_optical_flow.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_frame_interpolation.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/dlss_network_probe.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_camera_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_color.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
 )
 
 if (HAIKUOS)

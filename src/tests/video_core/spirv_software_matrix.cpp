@@ -454,6 +454,8 @@ constexpr u32 OP_COMPOSITE_EXTRACT = 81;
 constexpr u32 OP_COMPOSITE_INSERT = 82;
 constexpr u32 OP_BITCAST = 124;
 constexpr u32 OP_TYPE_COOPERATIVE_MATRIX = 4456;
+constexpr u32 OP_COOPERATIVE_MATRIX_LOAD = 4457;
+constexpr u32 OP_COOPERATIVE_MATRIX_STORE = 4458;
 constexpr u32 OP_COOPERATIVE_MATRIX_MUL_ADD = 4459;
 constexpr u32 CAPABILITY_COOPERATIVE_MATRIX = 6022;
 constexpr u32 CAPABILITY_FLOAT16 = 9;
@@ -468,7 +470,7 @@ std::map<u32, u32> Constants(const std::vector<u32>& code) {
     return constants;
 }
 
-void RequireHmmaMatrixTypes(const std::vector<u32>& code) {
+void RequireHmmaMatrixTypes(const std::vector<u32>& code, u32 columns = 8) {
     const auto constants = Constants(code);
     const auto types = Instructions(code, OP_TYPE_COOPERATIVE_MATRIX);
     REQUIRE(types.size() == 3);
@@ -479,7 +481,7 @@ void RequireHmmaMatrixTypes(const std::vector<u32>& code) {
         REQUIRE(constants.at(words[3]) == 16);
         columns_by_use.at(constants.at(words[5])) = constants.at(words[4]);
     }
-    REQUIRE(columns_by_use == std::array<u32, 3>{16, 8, 8}); // A, B, accumulator
+    REQUIRE(columns_by_use == std::array<u32, 3>{16, columns, columns}); // A, B, accumulator
 }
 
 // SPV_KHR_cooperative_matrix requires the Vulkan memory model, which spirv-val does not check.
@@ -633,6 +635,54 @@ TEST_CASE("Cooperative HMMA self-test shader runs one lowering on one warp",
     }
 }
 
+TEST_CASE("16x16x16 cooperative HMMA runs both depths through shared memory",
+          "[video_core][tensor][ampere]") {
+    for (const auto& [depth, version] : {std::pair{16U, 0x00010500U}, std::pair{16U, 0x00010600U},
+                                        std::pair{8U, 0x00010600U}}) {
+        TensorProgram fixture{3, depth};
+        fixture.profile.supported_spirv = version;
+        fixture.profile.support_cooperative_hmma_16x16x16 = true;
+        const auto code = fixture.Emit("cooperative-16x16x16-k" + std::to_string(depth) + "-" +
+                                       std::to_string(version));
+        REQUIRE(code[1] == version);
+        REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+        REQUIRE(HasCapability(code, CAPABILITY_FLOAT16));
+        RequireVulkanMemoryModel(code);
+        RequireHmmaMatrixTypes(code, 16);
+        REQUIRE(fixture.program.info.uses_cooperative_matrix);
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_LOAD).size() == 9);
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() == 3);
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_STORE).size() == 3);
+        REQUIRE(Instructions(code, 202).empty()); // OpBitFieldUExtract
+        REQUIRE(Instructions(code, 57).empty());  // OpFunctionCall
+        REQUIRE(Instructions(code, 345).empty()); // OpGroupNonUniformShuffle
+        REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);
+    }
+}
+
+TEST_CASE("16x16x16 cooperative HMMA falls back to the software helper",
+          "[video_core][tensor][ampere]") {
+    TensorProgram fixture{1, 16};
+    fixture.profile.support_cooperative_hmma_16x16x16 = true;
+    SECTION("a workgroup that leaves a warp unfilled") {
+        fixture.program.workgroup_size = {48, 1, 1};
+    }
+    SECTION("a workgroup row that leaves a warp unfilled") {
+        fixture.program.workgroup_size = {16, 2, 1};
+    }
+    SECTION("coherent memory, which the Vulkan memory model has no decoration for") {
+        fixture.program.info.requires_coherent_image_memory = true;
+    }
+    SECTION("scratch past the shared memory limit") {
+        fixture.profile.max_compute_shared_memory_size = 2 * 384 * 4 - 4;
+    }
+    const auto code = fixture.Emit();
+    REQUIRE_FALSE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+    REQUIRE(Instructions(code, 57).size() == 1); // OpFunctionCall
+    REQUIRE(fixture.program.shared_memory_size == 0);
+    REQUIRE_FALSE(fixture.program.info.uses_cooperative_matrix);
+}
+
 TEST_CASE("Captured Bananza matrix shaders lower without an environment override",
           "[video_core][tensor][ampere]") {
     TensorMode mode{nullptr};
@@ -674,4 +724,12 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     code[0].words[3] = 0;
     code[0].words[0] += 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
+}
+
+TEST_CASE("Native matrix lowering rejects matrix multiplies when asked", "[video_core][tensor][ampere]") {
+    const std::array<Ampere::Instruction, 2> code{{
+        {{0x0810723c, 12, 0x8ff, 0}}, {{0x0000794d, 0, 0x03800000, 0}}}};
+    const auto rejected = Ampere::LowerToMaxwell(code, {.tensor = true, .reject_matrix = true});
+    REQUIRE_FALSE(static_cast<bool>(rejected));
+    REQUIRE(rejected.error.find("matrix multiply") != std::string_view::npos);
 }
