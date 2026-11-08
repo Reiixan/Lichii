@@ -846,7 +846,7 @@ std::optional<ShaderCacheMigration> MigrateShaderCache(const std::filesystem::pa
                 in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
                 std::vector<FileEnvironment> envs(num_envs);
                 for (FileEnvironment& env : envs) {
-                    env.Deserialize(in);
+                    env.Deserialize(in, end);
                 }
                 const auto envs_end = in.tellg();
                 const auto copy_environments = [&] {

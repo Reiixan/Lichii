@@ -295,7 +295,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                         1, std::memory_order_release);
                 }
             }
-        } const written{!is_synced, cpu_addr};
+        } const written{true, cpu_addr};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -343,10 +343,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         impl->pending_unregister.push_back(query_location);
     });
     const auto issue = [&] {
-        if (!is_synced) {
-            Tegra::g_nx2_reports_issued[Tegra::Nx2PendingReportSlot(cpu_addr)].fetch_add(
-                1, std::memory_order_release);
-        }
+        Tegra::g_nx2_reports_issued[Tegra::Nx2PendingReportSlot(cpu_addr)].fetch_add(
+            1, std::memory_order_release);
     };
     if (is_fence) {
         issue();
