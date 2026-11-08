@@ -80,10 +80,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fork: Windows only. windows-x86_64-pgo uses lichii-windows.profdata, trained on
-          # Ocarina of Time (see docs/CI.md).
-          - platform: windows-x86_64
-            runner: windows-2022
+          # Fork: the Windows PGO build only (lichii-windows.profdata, trained on Ocarina of Time;
+          # see docs/CI.md).
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
