@@ -303,6 +303,15 @@ public:
         return std::nullopt;
     }
 
+    /// Ocarina of Time's gameplay upscaler stand-in (no cooperative matrices): draws its packed
+    /// frame (src, RGB9E5) into its output (dst) with the temporal upscaler (FSR 3.1/DLSS) when
+    /// it is enabled. False leaves the plain copy to the caller.
+    [[nodiscard]] virtual bool AccelerateOcarinaStandIn(
+        [[maybe_unused]] const Tegra::Engines::Fermi2D::Surface& src,
+        [[maybe_unused]] const Tegra::Engines::Fermi2D::Surface& dst) {
+        return false;
+    }
+
     /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
     /// this backend cannot bypass it or NVIDIA DLSS replaces the same output pass.
     [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {

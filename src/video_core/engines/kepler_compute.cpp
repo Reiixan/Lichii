@@ -1299,7 +1299,9 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
                                                      dlss_depth ? &*dlss_depth : nullptr,
                                                      dlss_jitter, {1.0f, 1.0f});
     };
-    const bool done = upscale_temporally() ||
+    // Ocarina's pair: FSR 3.1/DLSS in place of the plain copy, when the setting enables it.
+    const bool done = (rgb9e5_pair && rasterizer->AccelerateOcarinaStandIn(source, surface(*output))) ||
+                      upscale_temporally() ||
                       rasterizer->AccelerateSurfaceCopy(source, surface(*output), config);
     if (static u32 checked{}; checked++ == sample_at) {
         const u64 size = u64{output->Width()} * output->Height() * 4;

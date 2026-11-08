@@ -21,6 +21,7 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -2981,6 +2982,18 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
     mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
 }
 
+std::optional<Tegra::Texture::TICEntry> RasterizerVulkan::ReadComputeTic(u32 index) {
+    const auto& table = kepler_compute->regs.tic;
+    using Entry = Tegra::Texture::TICEntry;
+    const GPUVAddr address = table.Address() + u64{index} * sizeof(Entry);
+    if (index > table.limit || !gpu_memory->IsFullyMappedRange(address, sizeof(Entry))) {
+        return std::nullopt;
+    }
+    Entry entry{};
+    gpu_memory->ReadBlockUnsafe(address, &entry, sizeof(entry));
+    return entry;
+}
+
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
@@ -2988,17 +3001,6 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
     }
-    const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
-        const auto& table = kepler_compute->regs.tic;
-        using Entry = Tegra::Texture::TICEntry;
-        const GPUVAddr address = table.Address() + u64{index} * sizeof(Entry);
-        if (index > table.limit || !gpu_memory->IsFullyMappedRange(address, sizeof(Entry))) {
-            return std::nullopt;
-        }
-        Entry entry{};
-        gpu_memory->ReadBlockUnsafe(address, &entry, sizeof(entry));
-        return entry;
-    };
     if (!replace) {
         constexpr u32 depth_handle_offset = 0x128;
         const auto& qmd = kepler_compute->launch_description;
@@ -3008,7 +3010,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
             return false;
         }
         const u32 index = gpu_memory->Read<u32>(cbuf.Address() + depth_handle_offset) & 0xfffff;
-        const auto tic = read_tic(index);
+        const auto tic = ReadComputeTic(index);
         const bool scene_size = oot_camera_sample_frame != render_trace_frame ||
                                 (tic && tic->Width() == oot_motion.extent.width &&
                                  tic->Height() == oot_motion.extent.height);
@@ -3020,6 +3022,18 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         }
         return false;
     }
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    const bool bound = sampled.size() == 1 && written.size() == 1 && sampled[0].id && written[0];
+    return ReplaceOcarinaUpscale(bound ? sampled[0].id : VideoCommon::ImageViewId{},
+                                 bound ? written[0] : VideoCommon::ImageViewId{},
+                                 pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader,
+                                 upscale_4k);
+}
+
+bool RasterizerVulkan::ReplaceOcarinaUpscale(VideoCommon::ImageViewId color_id,
+                                             VideoCommon::ImageViewId target_id, bool native_size,
+                                             bool upscale_4k) {
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
     const auto fail = [this](const char* reason) {
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
@@ -3041,7 +3055,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     if (oot_motion.camera_channel != gpu_memory || oot_motion.depth_channel != gpu_memory) {
         return fail("camera and depth from another channel");
     }
-    const auto tic = read_tic(oot_motion.depth_tic);
+    const auto tic = ReadComputeTic(oot_motion.depth_tic);
     if (!tic || tic->Address() != oot_motion.depth_address ||
         tic->Width() != oot_motion.extent.width || tic->Height() != oot_motion.extent.height) {
         return fail("scene depth descriptor changed");
@@ -3060,17 +3074,14 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         return fail("unsupported scene depth");
     }
 
-    const auto sampled = pipeline.SampledImages();
-    const auto written = pipeline.WrittenImages();
-    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+    if (!color_id || !target_id) {
         return fail("unexpected upscale bindings");
     }
-    const auto& color = texture_cache.GetImageView(sampled[0].id);
-    auto& target = texture_cache.GetImageView(written[0]);
+    const auto& color = texture_cache.GetImageView(color_id);
+    auto& target = texture_cache.GetImageView(target_id);
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
-    const bool native_size = pipeline.ShaderHash() == ComputePipeline::OcarinaFullSizeShader;
     if (native_size && oot_backend != VideoCommon::OcarinaUpscaleBackend::Fsr) {
         return fail("full-size pass is FSR only");
     }
@@ -3322,6 +3333,42 @@ std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.ProbeGameDlssOutput(dst, src);
+}
+
+bool RasterizerVulkan::AccelerateOcarinaStandIn(const Tegra::Engines::Fermi2D::Surface& src,
+                                                const Tegra::Engines::Fermi2D::Surface& dst) {
+    // Without cooperative matrices the gameplay network never builds, so its output pass is
+    // never dispatched for TryOcarinaUpscale to replace: the stand-in's copy is the place.
+    if (!OcarinaTemporalEnabled()) {
+        return false;
+    }
+    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    const auto views = texture_cache.FindCopyViews(dst, src, true);
+    if (!views) {
+        static bool logged{};
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(Render_Vulkan, "Ocarina temporal: stand-in images not found, plain copy");
+        }
+        return false;
+    }
+    const auto& color = texture_cache.GetImageView(views->first);
+    const auto& target = texture_cache.GetImageView(views->second);
+    const bool native_size =
+        color.size.width == target.size.width && color.size.height == target.size.height;
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.NoteComputeWrites();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) { RecordDispatchBarrier(cmdbuf); });
+    if (!ReplaceOcarinaUpscale(views->first, views->second, native_size, false)) {
+        return false;
+    }
+    // The upscaler's command buffer bindings replace the cached ones.
+    scheduler.InvalidateState();
+    static bool logged{};
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(Render_Vulkan, "Ocarina temporal: the upscaler draws the stand-in's {}x{} -> {}x{}",
+                 color.size.width, color.size.height, target.size.width, target.size.height);
+    }
+    return true;
 }
 
 bool RasterizerVulkan::AccelerateTemporalUpscale(
