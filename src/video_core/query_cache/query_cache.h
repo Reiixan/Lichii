@@ -285,17 +285,6 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     std::function<void()> operation([this, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
                                      asid = gpu_memory->GetID(), counter_type] {
-        // Counted on every return: the front's DMA reads wait while the counts differ.
-        struct Written {
-            bool registered;
-            DAddr address;
-            ~Written() {
-                if (registered) {
-                    Tegra::g_nx2_reports_written[Tegra::Nx2PendingReportSlot(address)].fetch_add(
-                        1, std::memory_order_release);
-                }
-            }
-        } const written{true, cpu_addr};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -342,12 +331,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         impl->pending_unregister.push_back(query_location);
     });
-    const auto issue = [&] {
-        Tegra::g_nx2_reports_issued[Tegra::Nx2PendingReportSlot(cpu_addr)].fetch_add(
-            1, std::memory_order_release);
-    };
     if (is_fence) {
-        issue();
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
@@ -373,7 +357,6 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
-        issue();
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
