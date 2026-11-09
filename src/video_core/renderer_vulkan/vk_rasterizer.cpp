@@ -3357,7 +3357,18 @@ bool RasterizerVulkan::AccelerateOcarinaStandIn(const Tegra::Engines::Fermi2D::S
         color.size.width == target.size.width && color.size.height == target.size.height;
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.NoteComputeWrites();
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { RecordDispatchBarrier(cmdbuf); });
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               0, READ_BARRIER);
+    });
     if (!ReplaceOcarinaUpscale(views->first, views->second, native_size, false)) {
         return false;
     }
