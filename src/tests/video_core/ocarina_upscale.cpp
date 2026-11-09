@@ -12,15 +12,32 @@ TEST_CASE("OoT temporal backend selection is opt-in and vendor neutral", "[video
     CHECK(SelectOcarinaUpscaler(false, false, true, "") == Native);
     CHECK(SelectOcarinaUpscaler(true, false, false, "") == Fsr);
     CHECK(SelectOcarinaUpscaler(true, false, true, "") == Fsr);
-    CHECK(SelectOcarinaUpscaler(false, true, false, "") == Fsr);
+    CHECK(SelectOcarinaUpscaler(false, true, false, "") == Native);
     CHECK(SelectOcarinaUpscaler(false, true, true, "") == Dlss);
+    CHECK(SelectOcarinaUpscaler(true, true, false, "") == Fsr);
+    CHECK(SelectOcarinaUpscaler(true, true, true, "") == Dlss);
     CHECK(SelectOcarinaUpscaler(true, true, true, "native") == Native);
     CHECK(SelectOcarinaUpscaler(false, true, true, "fsr") == Fsr);
     CHECK(SelectOcarinaUpscaler(false, false, false, "fsr") == Fsr);
-    CHECK(SelectOcarinaUpscaler(false, false, false, "dlss") == Fsr);
-    CHECK(SelectOcarinaUpscaler(false, false, true, "dlss") == Fsr);
+    CHECK(SelectOcarinaUpscaler(false, false, false, "dlss") == Native);
+    CHECK(SelectOcarinaUpscaler(false, false, true, "dlss") == Dlss);
     CHECK(SelectOcarinaUpscaler(false, true, true, "dlss") == Dlss);
     CHECK(SelectOcarinaUpscaler(false, false, false, "garbage") == Native);
+}
+
+TEST_CASE("OoT FSR texture LOD bias follows the upscaler, the console mode and failure",
+          "[video_core][ocarina]") {
+    using enum VideoCommon::OcarinaUpscaleBackend;
+    using VideoCommon::KeepOcarinaFsrLodBias;
+    using VideoCommon::OcarinaFsrLodBias;
+    CHECK(OcarinaFsrLodBias(Fsr) == -1.58f);
+    CHECK(OcarinaFsrLodBias(Dlss) == 0.0f);
+    CHECK(OcarinaFsrLodBias(Native) == 0.0f);
+    CHECK(KeepOcarinaFsrLodBias(true, false, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(false, false, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, false, true));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, false));
+    CHECK_FALSE(KeepOcarinaFsrLodBias(true, true, true));
 }
 
 TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core][fsr][ocarina]") {
