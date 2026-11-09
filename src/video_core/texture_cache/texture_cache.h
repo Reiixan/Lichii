@@ -1567,29 +1567,6 @@ std::optional<VideoCore::GameDlssProbe> TextureCache<P>::ProbeGameDlssOutput(
     if constexpr (FRAMEBUFFER_BLITS) {
         return std::nullopt;
     } else {
-        const auto views = FindCopyViews(dst, src, false);
-        if (!views) {
-            return std::nullopt;
-        }
-        for (const ImageViewId id : {views->first, views->second}) {
-            // The network runs only at the game's own resolution.
-            const Image& image = slot_images[slot_image_views[id].image_id];
-            if (image.info.num_samples != 1 || True(image.flags & ImageFlagBits::Rescaled)) {
-                return std::nullopt;
-            }
-        }
-        return runtime.ProbeGameDlssOutput(slot_image_views[views->first],
-                                           slot_image_views[views->second]);
-    }
-}
-
-template <class P>
-std::optional<std::pair<ImageViewId, ImageViewId>> TextureCache<P>::FindCopyViews(
-    const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
-    bool dst_written) {
-    if constexpr (FRAMEBUFFER_BLITS) {
-        return std::nullopt;
-    } else {
         const Tegra::Engines::Fermi2D::Config copy{
             .operation = Tegra::Engines::Fermi2D::Operation::SrcCopy,
             .filter = Tegra::Engines::Fermi2D::Filter::Point,
@@ -1610,7 +1587,14 @@ std::optional<std::pair<ImageViewId, ImageViewId>> TextureCache<P>::FindCopyView
         const ImageId dst_id = result->dst_id;
         const ImageId src_id = result->src_id;
         PrepareImage(src_id, false, false);
-        PrepareImage(dst_id, dst_written, false);
+        PrepareImage(dst_id, false, false);
+        for (const ImageId id : {src_id, dst_id}) {
+            // The network runs only at the game's own resolution.
+            if (slot_images[id].info.num_samples != 1 ||
+                True(slot_images[id].flags & ImageFlagBits::Rescaled)) {
+                return std::nullopt;
+            }
+        }
         const auto view = [&](ImageId id, const Tegra::Engines::Fermi2D::Surface& surface,
                               PixelFormat format) -> std::optional<ImageViewId> {
             const std::optional base = slot_images[id].TryFindBase(surface.Address());
@@ -1625,7 +1609,8 @@ std::optional<std::pair<ImageViewId, ImageViewId>> TextureCache<P>::FindCopyView
         if (!src_view || !dst_view) {
             return std::nullopt;
         }
-        return std::pair{*src_view, *dst_view};
+        return runtime.ProbeGameDlssOutput(slot_image_views[*src_view],
+                                           slot_image_views[*dst_view]);
     }
 }
 

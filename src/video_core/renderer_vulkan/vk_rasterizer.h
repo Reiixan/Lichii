@@ -161,8 +161,6 @@ public:
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src,
         const Tegra::Engines::Fermi2D::Surface& dst) override;
-    bool AccelerateOcarinaStandIn(const Tegra::Engines::Fermi2D::Surface& src,
-                                  const Tegra::Engines::Fermi2D::Surface& dst) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
@@ -267,13 +265,7 @@ private:
     bool OcarinaTemporalEnabled() const;
     void TrackOcarinaCamera();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
-    /// The compute engine's texture descriptor at index, if mapped.
-    std::optional<Tegra::Texture::TICEntry> ReadComputeTic(u32 index);
     bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
-    /// Draws Ocarina's upscale into target_id with the temporal upscaler; TryOcarinaUpscale's and
-    /// AccelerateOcarinaStandIn's shared part (textures and buffers locked).
-    bool ReplaceOcarinaUpscale(VideoCommon::ImageViewId color_id, VideoCommon::ImageViewId target_id,
-                               bool native_size, bool upscale_4k);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);

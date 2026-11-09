@@ -400,12 +400,6 @@ public:
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src);
 
-    /// The views of a full-image copy's source (src) and destination (dst), found as BlitImage
-    /// finds them, with src refreshed and dst prepared (for a GPU write when dst_written).
-    std::optional<std::pair<ImageViewId, ImageViewId>> FindCopyViews(
-        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
-        bool dst_written);
-
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
         const Tegra::FramebufferConfig& config, DAddr cpu_addr);
