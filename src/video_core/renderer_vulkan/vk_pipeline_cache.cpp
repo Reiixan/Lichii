@@ -2292,7 +2292,7 @@ void PipelineCache::EvictUnusedPipelines() {
         if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
-        evicted_pointer_slots.Remember(it->first.Hash(), pipeline->MappedPointers());
+        evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         graphics_cache.erase(it);
     }
