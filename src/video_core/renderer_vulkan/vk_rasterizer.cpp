@@ -2724,6 +2724,19 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     pending_native_work = false;
+    // Nothing recorded since the last submit: nothing to send. A fence with a download is flushed
+    // by InnerFence::Queue and then again here with an empty command buffer: ~4,600 empty submits
+    // a second in Castle Town (Frizti EXP61, 43.0 -> 45.6 fps there). EDEN_NX2_SKIP_EMPTY_FLUSH=0
+    // submits them as before. Read on first use, after nx2_switches.txt is applied.
+    static const bool skip_empty_flush = [] {
+        const char* const value = std::getenv("EDEN_NX2_SKIP_EMPTY_FLUSH");
+        const bool on = value == nullptr || std::atoi(value) != 0;
+        LOG_INFO(Render_Vulkan, "Empty FlushCommands submits: {}", on ? "skipped" : "sent");
+        return on;
+    }();
+    if (skip_empty_flush && !scheduler.RecordedSinceSubmit()) {
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
