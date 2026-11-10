@@ -398,10 +398,37 @@ std::string Sample(const char* names, double seconds, const std::string& out) {
 
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
-    if (names == nullptr || *names == '\0') {
+    const double stall = EnvSeconds("EDEN_NX2_SAMPLE_STALL", 0.0);
+    const bool has_names = names != nullptr && *names != '\0';
+    if (!has_names && stall <= 0.0) {
         return;
     }
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
+    if (stall > 0.0) {
+        std::thread{[patterns = SplitNames(has_names ? names : "CPUCore_*"), stall,
+                     seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 20.0),
+                     out = std::string{out != nullptr ? out : "nx2_samples.txt"}] {
+            constexpr unsigned long long ArmFrames = 600;
+            constexpr unsigned MaxReports = 8;
+            const auto pause = std::chrono::milliseconds{250};
+            const auto stall_ns = static_cast<long long>(stall * 1e9);
+            for (unsigned report = 1; report <= MaxReports;) {
+                std::this_thread::sleep_for(pause);
+                const unsigned long long frames = g_frames.load(std::memory_order_relaxed);
+                if (frames < ArmFrames ||
+                    NowNs() - g_last_frame_ns.load(std::memory_order_relaxed) < stall_ns) {
+                    continue;
+                }
+                SampleThreads(patterns, seconds, fmt::format("{}.stall{}.txt", out, report));
+                ++report;
+                // The next report is for the next stall: wait for a frame first.
+                while (g_frames.load(std::memory_order_relaxed) == frames) {
+                    std::this_thread::sleep_for(pause);
+                }
+            }
+        }}.detach();
+        return;
+    }
     std::thread{[patterns = SplitNames(names), start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
                  seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
                  out = std::string{out != nullptr ? out : "nx2_samples.txt"}] {

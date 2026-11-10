@@ -83,6 +83,11 @@ public:
     /// nullopt when all of it is committed from the start.
     [[nodiscard]] std::optional<u64> CommittedBackingBytes() const noexcept;
 
+    /// Windows: guest memory that is committed by its first access cannot be read or written by
+    /// the host kernel before that (ReadFile fails with ERROR_NOACCESS). Call this for a buffer
+    /// about to be handed to a system call; anything that is not guest memory is ignored.
+    static void EnsureAccessible(const void* address, size_t length) noexcept;
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }

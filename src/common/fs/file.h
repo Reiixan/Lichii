@@ -14,6 +14,7 @@
 #include "common/concepts.h"
 #include "common/fs/fs_types.h"
 #include "common/fs/fs_util.h"
+#include "common/host_memory.h"
 
 namespace Common::FS {
 
@@ -285,6 +286,7 @@ public:
         if (!IsOpen()) {
             return 0;
         }
+        HostMemory::EnsureAccessible(data.data(), data.size_bytes());
         return std::fread(data.data(), sizeof(T), data.size(), file);
     }
 
@@ -311,6 +313,7 @@ public:
             return 0;
         }
 
+        HostMemory::EnsureAccessible(data.data(), data.size_bytes());
         return std::fwrite(data.data(), sizeof(T), data.size(), file);
     }
 

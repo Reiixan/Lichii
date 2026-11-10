@@ -179,10 +179,18 @@ public:
         // view's pages have to be committed for VirtualProtect and for the host kernel to write to
         // them (ReadFile into a guest buffer). Any other access to the backing commits its chunk
         // from CommitFaultHandler. EDEN_NX2_LAZY_GUEST_COMMIT=0 commits everything up front.
-        if (LazyCommitWanted()) {
+        //
+        // The guest asks for far more than it touches (Ocarina of Time: 10 GiB handed out, about
+        // half of it in use), so allocations of a chunk or more, the heaps, are not committed
+        // when handed out either (lazy_large): their chunks are committed by the first access to
+        // them, through the backing or a view. What needs committed pages commits them itself:
+        // Protect, and file reads and writes through HostMemory::EnsureAccessible.
+        // EDEN_NX2_LAZY_GUEST_COMMIT=1 commits those allocations when handed out as well.
+        if (const int mode = LazyCommitMode(); mode != 0) {
             committed_chunks = std::make_unique<std::atomic<u8>[]>(
                 Common::DivCeil(backing_size, CommitChunkSize));
             lazy_commit = RegisterLazy();
+            lazy_large = lazy_commit && mode >= 2;
         }
         const ULONG section_attributes = lazy_commit ? SEC_RESERVE : SEC_COMMIT;
         // Allocate backing file map. SEC_COMMIT charges all of it to the commit limit up front, and
@@ -237,7 +245,8 @@ public:
             return false;
         }
         if (lazy_commit) {
-            LOG_INFO(HW_Memory, "Guest memory: {} MiB reserved, committed as the guest uses it", backing_size >> 20);
+            LOG_INFO(HW_Memory, "Guest memory: {} MiB reserved, committed as the guest uses it ({})", backing_size >> 20,
+                     lazy_large ? "large allocations on their first access" : "when handed out");
         }
         return true;
     }
@@ -261,7 +270,7 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
-        EnsureCommitted(host_offset, length);
+        HandedOut(host_offset, length);
         std::unique_lock lock{placeholder_mutex};
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
@@ -301,17 +310,110 @@ public:
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
-            DWORD old_flags{};
-            if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
-                LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
+            const auto host_it = placeholder_host_pointers.find(it->lower());
+            if (lazy_large && host_it != placeholder_host_pointers.end()) {
+                ProtectLazy(offset, host_it->second + (offset - it->lower()), protect_length,
+                            new_flags);
+            } else {
+                ProtectView(offset, protect_length, new_flags);
             }
             ++it;
         }
     }
 
+    void ProtectView(size_t virtual_offset, size_t length, DWORD new_flags) {
+        DWORD old_flags{};
+        if (!VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+            LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
+        }
+    }
+
+    /// Protect for a view whose backing, at host_offset, may hold chunks that are not committed:
+    /// VirtualProtect refuses a range with such pages.
+    void ProtectLazy(size_t virtual_offset, size_t host_offset, size_t length, DWORD new_flags) {
+        if (new_flags != PAGE_READWRITE) {
+            // A trap has to be there when the page is first used: commit, then protect.
+            EnsureCommitted(host_offset, length);
+            ProtectView(virtual_offset, length, new_flags);
+            return;
+        }
+        // Pages are writable when they are committed: only the committed ones need changing.
+        const size_t host_end = host_offset + length;
+        const auto chunk_end = [host_end](size_t offset) {
+            return (std::min)(((offset >> CommitChunkShift) + 1) << CommitChunkShift, host_end);
+        };
+        for (size_t run = host_offset; run < host_end;) {
+            const bool committed = IsCommittedAt(run);
+            size_t run_end = chunk_end(run);
+            while (run_end < host_end && IsCommittedAt(run_end) == committed) {
+                run_end = chunk_end(run_end);
+            }
+            if (committed) {
+                ProtectView(virtual_offset + (run - host_offset), run_end - run, new_flags);
+            }
+            run = run_end;
+        }
+    }
+
+    /// Memory the guest kernel hands out or maps: committed now, except for the allocations
+    /// lazy_large leaves to their first access.
+    void HandedOut(size_t offset, size_t length) noexcept {
+        if (lazy_large && length >= CommitChunkSize) {
+            return;
+        }
+        EnsureCommitted(offset, length);
+    }
+
+    /// False when the chunk holding this backing offset is not committed: it holds no data.
+    bool IsCommittedAt(size_t offset) const noexcept {
+        return !lazy_commit || offset >= backing_size ||
+               committed_chunks[offset >> CommitChunkShift].load(std::memory_order_acquire) != 0;
+    }
+
+    /// Commits what [address, address + length) covers of this backing or of its views, for
+    /// the host kernel to read or write it: a system call fails on pages that are not committed.
+    void CommitAddressRange(uintptr_t address, size_t length) {
+        if (!lazy_large || length == 0) {
+            return;
+        }
+        const auto base = reinterpret_cast<uintptr_t>(backing_base);
+        if (address >= base && address - base < backing_size) {
+            EnsureCommitted(address - base, length);
+            return;
+        }
+        const auto view = reinterpret_cast<uintptr_t>(virtual_base);
+        if (view == 0 || address < view || address - view >= virtual_size) {
+            return;
+        }
+        const size_t begin = address - view;
+        const size_t end = begin + (std::min)(length, virtual_size - begin);
+        std::shared_lock lock{placeholder_mutex};
+        auto [it, last] = placeholders.equal_range({begin, end});
+        for (; it != last; ++it) {
+            const auto host_it = placeholder_host_pointers.find(it->lower());
+            if (host_it == placeholder_host_pointers.end()) {
+                continue;
+            }
+            const size_t piece = (std::max)(it->lower(), begin);
+            EnsureCommitted(host_it->second + (piece - it->lower()),
+                            (std::min)(it->upper(), end) - piece);
+        }
+    }
+
+    static void CommitAddressRangeAll(uintptr_t address, size_t length) {
+        AcquireSRWLockShared(&lazy_lock);
+        for (Impl* const lazy : lazy_impls) {
+            if (lazy != nullptr) {
+                lazy->CommitAddressRange(address, length);
+            }
+        }
+        ReleaseSRWLockShared(&lazy_lock);
+    }
+
     /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
+    /// Shared: it only reads, and guest threads call it from the fault handler at the same time.
     std::optional<size_t> BackingOffset(size_t virtual_offset) {
-        std::scoped_lock lock{placeholder_mutex};
+        std::shared_lock lock{placeholder_mutex};
         const auto it = placeholders.find(virtual_offset);
         if (it == placeholders.end()) {
             return std::nullopt;
@@ -385,9 +487,13 @@ public:
     u8* virtual_base{};
 
 private:
-    static bool LazyCommitWanted() {
+    /// 0: everything committed up front, 1: when handed out, 2: large allocations when touched.
+    static int LazyCommitMode() {
         const char* const value = std::getenv("EDEN_NX2_LAZY_GUEST_COMMIT");
-        return value == nullptr || value[0] != '0';
+        if (value == nullptr) {
+            return 2;
+        }
+        return value[0] == '0' ? 0 : value[0] == '1' ? 1 : 2;
     }
 
     bool CommitRange(size_t begin, size_t length) noexcept {
@@ -413,19 +519,41 @@ private:
 
     /// An access to backing memory that is not committed yet: commits its chunk. True when the
     /// access can run again.
-    bool CommitOnFault(uintptr_t address) noexcept {
+    bool CommitOnFault(uintptr_t address, bool is_write) noexcept {
         const auto base = reinterpret_cast<uintptr_t>(backing_base);
-        if (!lazy_commit || base == 0 || address < base || address - base >= backing_size) {
+        if (!lazy_commit || base == 0) {
             return false;
         }
-        const size_t offset = address - base;
+        size_t offset{};
+        bool in_view = false;
+        if (address >= base && address - base < backing_size) {
+            offset = address - base;
+        } else {
+            // A view: the guest's own accesses (fastmem) to an allocation left to its first access.
+            const auto view = reinterpret_cast<uintptr_t>(virtual_base);
+            if (!lazy_large || view == 0 || address < view || address - view >= virtual_size) {
+                return false;
+            }
+            const std::optional<size_t> host_offset = BackingOffset(address - view);
+            if (!host_offset || *host_offset >= backing_size) {
+                return false;
+            }
+            offset = *host_offset;
+            in_view = true;
+        }
         const size_t index = offset >> CommitChunkShift;
         if (committed_chunks[index].load(std::memory_order_acquire) != 0) {
             // Another thread committed the chunk after this one faulted: the access works now.
-            // A fault on committed memory is not for this handler.
+            // A fault on committed memory is not for this handler. In a view that is a page the
+            // GPU caches or the guest protected, whose fault belongs to the JIT's handler: only an
+            // access the page allows by now was that race.
             MEMORY_BASIC_INFORMATION info{};
-            return VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
-                   info.State == MEM_COMMIT;
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0 ||
+                info.State != MEM_COMMIT) {
+                return false;
+            }
+            return !in_view || info.Protect == PAGE_READWRITE ||
+                   (!is_write && info.Protect == PAGE_READONLY);
         }
         if (!EnsureCommitted(index << CommitChunkShift, CommitChunkSize)) {
             return false;
@@ -448,7 +576,8 @@ private:
         bool handled = false;
         AcquireSRWLockShared(&lazy_lock);
         for (Impl* const lazy : lazy_impls) {
-            if (lazy != nullptr && lazy->CommitOnFault(address)) {
+            if (lazy != nullptr &&
+                lazy->CommitOnFault(address, record.ExceptionInformation[0] == 1)) {
                 handled = true;
                 break;
             }
@@ -487,6 +616,7 @@ private:
         }
         ReleaseSRWLockExclusive(&lazy_lock);
         lazy_commit = false;
+        lazy_large = false;
     }
 
     /// Release all resources in the object
@@ -643,6 +773,7 @@ private:
     HANDLE backing_handle{}; ///< File based backing memory
 
     bool lazy_commit{}; ///< The backing section is SEC_RESERVE: pages are committed on demand
+    bool lazy_large{};  ///< Allocations of a chunk or more are committed by their first access
     std::unique_ptr<std::atomic<u8>[]> committed_chunks; ///< Non-zero: the chunk is committed
     std::mutex commit_mutex;
     std::atomic<u64> committed_bytes{};
@@ -1445,6 +1576,10 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 #ifdef __linux__
             cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
 #endif
+#ifdef _WIN32
+            // Memory that was never committed holds no data, and a memset would commit it.
+            cleared = impl && !impl->IsCommittedAt(offset);
+#endif
             if (!cleared) {
                 std::memset(backing_base + offset, 0, clear_end - offset);
                 g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
@@ -1463,7 +1598,7 @@ void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
     }
 #ifdef _WIN32
     if (impl) {
-        impl->EnsureCommitted(physical_offset, length);
+        impl->HandedOut(physical_offset, length);
     }
 #endif
     const size_t last = (physical_offset + length - 1) >> GranuleShift;
@@ -1482,6 +1617,13 @@ void HostMemory::MarkDirty(size_t physical_offset, size_t length) {
     for (size_t index = physical_offset >> GranuleShift; index <= last; ++index) {
         granules[index].fetch_or(GranuleDirty, std::memory_order_release);
     }
+}
+
+void HostMemory::EnsureAccessible([[maybe_unused]] const void* address,
+                                  [[maybe_unused]] size_t length) noexcept {
+#ifdef _WIN32
+    Impl::CommitAddressRangeAll(reinterpret_cast<uintptr_t>(address), length);
+#endif
 }
 
 std::optional<u64> HostMemory::CommittedBackingBytes() const noexcept {
