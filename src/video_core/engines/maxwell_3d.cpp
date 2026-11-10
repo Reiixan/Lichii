@@ -391,6 +391,9 @@ bool IsFastDrawQueryMethod(u32 method) {
 
 } // Anonymous namespace
 
+// Whether a write to `method` leaves what a fast draw keeps from the draw before (pipeline, image
+// views, samplers, texture buffer bindings): the draw reads the register again on both paths, or
+// nothing a draw resolves from reads it.
 bool Maxwell3D::IsFastDrawParameter(u32 method) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.size):
@@ -420,6 +423,8 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     }
 }
 
+// Whether `method` is a vertex stream register the draw binds again on both paths: its address,
+// size and limit, and its stride and enable word where strides are dynamic state.
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
     constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
@@ -457,6 +462,8 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
     }
 }
 
+// Runs what a write to `method` does besides storing the register (draws, clears, queries,
+// uploads, macros), and ends the fast draw chain unless the method cannot change a draw.
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
     if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
         // A fence-flagged release signals a fence: never neutral for the fast draw path.
