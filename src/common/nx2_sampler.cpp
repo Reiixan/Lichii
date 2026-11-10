@@ -142,6 +142,23 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+// One unwind step. RtlVirtualUnwind reads saved registers through the frame's own registers, and
+// on a guest core those can hold guest values (JIT code uses them all): it then read address 0x36
+// and the access violation ended the process (Ocarina of Time, sampling CPUCore_* while a save
+// loaded). False when the step faults, which ends the walk. In a function of its own: __try
+// does not go with objects that have destructors.
+__declspec(noinline) bool UnwindStep(DWORD64 image_base, PRUNTIME_FUNCTION function, CONTEXT& context) {
+    __try {
+        PVOID handler_data{};
+        DWORD64 establisher_frame{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                         &handler_data, &establisher_frame, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
@@ -169,10 +186,9 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
             context.Rsp += 8;
             continue;
         }
-        PVOID handler_data{};
-        DWORD64 establisher_frame{};
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
-                         &handler_data, &establisher_frame, nullptr);
+        if (!UnwindStep(image_base, function, context)) {
+            break;
+        }
     }
     return depth;
 }
