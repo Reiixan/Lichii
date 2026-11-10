@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <utility>
 
 #include "common/alignment.h"
@@ -38,16 +39,6 @@
 namespace Service::Nvidia::Devices {
 
 namespace {
-
-// EDEN_NX2_STALE_MAP_FIX=0 only reports stale device ranges (Nx2RefreshBacking) and leaves them
-// pointing at the old pages, as before.
-bool Nx2StaleMapFix() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_STALE_MAP_FIX");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
-}
 
 // A device (SMMU) range keeps the host pages that backed its CPU range when it was mapped. The
 // ranges are reused by CPU address and size: when nx2:gpu 102 destroyed the memory, the game
@@ -79,18 +70,13 @@ void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Me
     if (stale_pages == 0) {
         return;
     }
-    const bool fix = Nx2StaleMapFix();
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1, std::memory_order_relaxed) < 256) {
         LOG_WARNING(Service_NVDRV,
                     "Switch 2 device range {:#x} of CPU {:#x}+{:#x}: {} of {} pages point at old "
-                    "memory (first at +{:#x}){}",
+                    "memory (first at +{:#x}), mapped again",
                     device_address, cpu_address, size, stale_pages,
-                    (size + PageSize - 1) / PageSize, first_stale,
-                    fix ? ", mapped again" : ", left as is (EDEN_NX2_STALE_MAP_FIX=0)");
-    }
-    if (!fix) {
-        return;
+                    (size + PageSize - 1) / PageSize, first_stale);
     }
     // Unmapping drops the old pages from the reverse map and invalidates the caches over the range.
     smmu.Unmap(device_address, size);
@@ -249,13 +235,16 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     // A reused range is checked there too, before the GMMU map, against the pages the CPU range
     // has now (Nx2RefreshBacking).
-    auto* const memory = fresh ? nullptr : &session->process->GetMemory();
+    auto process = fresh ? nullptr
+                         : std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
+                               system.Kernel(), session->process);
     system.GPU().MapInOrder(
         gpu_address, size,
-        [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), memory,
+        [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), process = std::move(process),
          asid = session->asid, gpu_address, cpu_address, device_address, size] {
-            if (memory != nullptr) {
-                Nx2RefreshBacking(smmu, *memory, asid, device_address, cpu_address, size);
+            if (process) {
+                Nx2RefreshBacking(smmu, process->GetPointerUnsafe()->GetMemory(), asid,
+                                  device_address, cpu_address, size);
             }
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
