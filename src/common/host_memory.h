@@ -79,6 +79,10 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
+    /// Windows: bytes of the backing committed so far when it is committed as the guest uses it,
+    /// nullopt when all of it is committed from the start.
+    [[nodiscard]] std::optional<u64> CommittedBackingBytes() const noexcept;
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }

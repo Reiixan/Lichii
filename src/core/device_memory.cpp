@@ -44,6 +44,8 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     std::mutex mutex;
     std::condition_variable_any wake;
     std::chrono::seconds interval = 5s;
+    constexpr u64 CommitLogStep = u64{256} << 20;
+    u64 logged_committed = 0;
     while (true) {
         {
             std::unique_lock lock{mutex};
@@ -57,6 +59,11 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+        if (const auto committed = buffer.CommittedBackingBytes();
+            committed && *committed >= logged_committed + CommitLogStep) {
+            logged_committed = *committed;
+            LOG_INFO(HW_Memory, "Guest memory: {} MiB committed so far", *committed >> 20);
+        }
         if (trimmed < Busy) {
             interval = (std::min)(interval * 2, std::chrono::seconds{60});
             continue;
