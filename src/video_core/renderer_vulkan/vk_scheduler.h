@@ -127,6 +127,20 @@ public:
         return fragment_barrier.Pending();
     }
 
+    /// Guest wait-for-idle inside a render pass: instead of ending the render pass now, the next
+    /// draw ends it only when it could see a hazard (as after a fragment barrier), and the full
+    /// barrier is recorded right after the render pass ends. Returns false when no render pass is
+    /// active, so the caller records the barrier itself.
+    bool DeferWaitForIdle(VkPipelineStageFlags src_stages) {
+        if (state.renderpass == VK_NULL_HANDLE) {
+            return false;
+        }
+        pending_wfi_stages |= src_stages;
+        fragment_barrier.Defer(true);
+        ++deferred_wfi_count;
+        return true;
+    }
+
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
     }
@@ -468,6 +482,9 @@ private:
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
     bool compute_writes_pending{};
+    VkPipelineStageFlags pending_wfi_stages{};
+    u64 deferred_wfi_count{};
+    u64 realized_wfi_count{};
     bool graphics_pipeline_missing{};
     u64 render_pass_serial{};
     std::unique_ptr<CommandPool> command_pool;

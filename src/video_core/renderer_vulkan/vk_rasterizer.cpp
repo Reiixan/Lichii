@@ -2694,6 +2694,24 @@ void RasterizerVulkan::WaitForIdle() {
         fence_manager.SignalOrdering();
         return;
     }
+    // Inside a render pass the barrier waits until the render pass ends: the next draw ends it
+    // early when it stores to memory or samples a render target, as after a fragment barrier,
+    // and anything that must run outside a render pass ends it too. Ocarina ended ~2,650 render
+    // passes a second here. Transform feedback keeps the old path (its output is read as
+    // vertices). EDEN_NX2_DEFER_WFI=0 ends the render pass at once as before. Read on first use,
+    // after nx2_switches.txt is applied.
+    static const bool defer_wfi = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEFER_WFI");
+        const bool on = value == nullptr || std::atoi(value) != 0;
+        LOG_INFO(Render_Vulkan, "Wait-for-idle inside render passes: {}",
+                 on ? "deferred" : "ends the render pass");
+        return on;
+    }();
+    if (defer_wfi && maxwell3d->regs.transform_feedback_enabled == 0 &&
+        scheduler.DeferWaitForIdle(flags)) {
+        fence_manager.SignalOrdering();
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
         // Later work waits for the earlier work and sees its writes.

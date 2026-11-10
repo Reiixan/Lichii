@@ -963,6 +963,31 @@ void Scheduler::EndRenderPass()
                                        0, XFB_OUTPUT_BARRIER);
             }
         });
+        if (pending_wfi_stages != 0) {
+            // A guest wait-for-idle deferred inside this render pass (DeferWaitForIdle).
+            ++realized_wfi_count;
+            Record([stages = pending_wfi_stages](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+            });
+            pending_wfi_stages = 0;
+        }
+        static auto wfi_window = std::chrono::steady_clock::now();
+        if (deferred_wfi_count != 0 &&
+            std::chrono::steady_clock::now() - wfi_window > std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan,
+                     "Deferred wait-for-idle in the last 10 s: {} deferred, {} render passes "
+                     "ended with one pending",
+                     deferred_wfi_count, realized_wfi_count);
+            deferred_wfi_count = 0;
+            realized_wfi_count = 0;
+            wfi_window = std::chrono::steady_clock::now();
+        }
 
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
