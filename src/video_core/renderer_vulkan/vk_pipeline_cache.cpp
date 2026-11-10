@@ -505,6 +505,26 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
     return static_cast<size_t>(hash);
 }
 
+namespace {
+/// Whether the driver's own disk cache replaces Eden's VkPipelineCache. AMD's keeps too few
+/// pipelines for shader cache v2: an Ocarina of Time boot rebuilt its ~5,000 boot pipelines in
+/// 6 to 18 minutes on an RX 6650 XT (2 minutes before v2), its VkCache folder full at ~790 MB.
+/// EDEN_NX2_AMD_PIPELINE_CACHE=0 leaves AMD to its driver's cache as before.
+bool LeavePipelineCacheToDriver(const Device& device) {
+    if (!device.DriverCachesPipelines()) {
+        return false;
+    }
+    if (device.GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY) {
+        return true;
+    }
+    const char* const value = std::getenv("EDEN_NX2_AMD_PIPELINE_CACHE");
+    const bool own_cache = value == nullptr || std::atoi(value) != 0;
+    LOG_INFO(Render_Vulkan, "AMD pipeline cache: {}",
+             own_cache ? "Eden's VkPipelineCache on disk" : "left to the driver");
+    return !own_cache;
+}
+} // Anonymous namespace
+
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
     if (unique_hashes != rhs.unique_hashes) {
         return false;
@@ -527,7 +547,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
-                                !device_.DriverCachesPipelines()},
+                                !LeavePipelineCacheToDriver(device_)},
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
