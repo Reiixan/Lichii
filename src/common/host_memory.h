@@ -113,6 +113,9 @@ public:
 private:
     void Swap(HostMemory& other) noexcept;
 
+    /// MarkUsed's bookkeeping alone.
+    void MarkGranulesUsed(size_t physical_offset, size_t length);
+
     friend class HostMemoryTestAccess;
     struct AllocationTestControl {
         size_t backing_size;

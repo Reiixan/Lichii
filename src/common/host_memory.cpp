@@ -1548,7 +1548,10 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     if (length == 0) {
         return;
     }
-    MarkUsed(physical_offset, length);
+    // Not MarkUsed: the kernel clears some allocations a page at a time, and a clear is no reason
+    // to commit memory (Windows). What it handed out was committed, or left to its first access,
+    // when it was handed out.
+    MarkGranulesUsed(physical_offset, length);
     if (fill_value != 0) {
         std::memset(backing_base + physical_offset, fill_value, length);
         MarkDirty(physical_offset, length);
@@ -1601,6 +1604,13 @@ void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
         impl->HandedOut(physical_offset, length);
     }
 #endif
+    MarkGranulesUsed(physical_offset, length);
+}
+
+void HostMemory::MarkGranulesUsed(size_t physical_offset, size_t length) {
+    if (length == 0) {
+        return;
+    }
     const size_t last = (physical_offset + length - 1) >> GranuleShift;
     for (size_t index = physical_offset >> GranuleShift; index <= last; ++index) {
         if ((granules[index].load(std::memory_order_relaxed) & GranuleUsed) == 0) {
