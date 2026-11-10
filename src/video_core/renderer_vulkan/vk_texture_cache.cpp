@@ -76,11 +76,74 @@ using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::SurfaceType;
 
 namespace {
+// The leading mip levels of a block-compressed copy of `info` whose size in 4x4 blocks is their
+// level 0 block count shifted down (HasUnevenBlockMips: the first one that isn't ends the run).
+[[nodiscard]] u32 EvenBlockMipCount(const ImageInfo& info) {
+    const u32 blocks_x = Common::DivCeil(info.size.width, 4U);
+    const u32 blocks_y = Common::DivCeil(info.size.height, 4U);
+    const u32 levels = static_cast<u32>((std::max)(info.resources.levels, 1));
+    for (u32 level = 1; level < levels; ++level) {
+        const u32 level_x = Common::DivCeil((std::max)(info.size.width >> level, 1U), 4U);
+        const u32 level_y = Common::DivCeil((std::max)(info.size.height >> level, 1U), 4U);
+        if (level_x != (std::max)(blocks_x >> level, 1U) ||
+            level_y != (std::max)(blocks_y >> level, 1U)) {
+            return level;
+        }
+    }
+    return levels;
+}
+
+// Set by TextureCacheRuntime on AMD drivers without native ASTC (EDEN_NX2_UNEVEN_BC_TRIM=0 clears
+// it): ASTC with uneven block mips is re-compressed to BC1/BC3 with only its even leading levels.
+std::atomic_bool g_uneven_bc_tail_trim{false};
+
+// The host levels of GPU-transcoded ASTC whose block-compressed mip chain turns uneven (AMD samples
+// those levels wrong: dark seams on distant terrain, dotted shadows in Ocarina of Time) when the
+// even levels already reach 64 texels: those levels stay BC1/BC3 and the smaller ones are left
+// out, sampling clamps to the last one. A 1536x1536 texture keeps 8 of 11 levels (down to 12x12)
+// in 3 MiB of BC3 instead of 12 MiB of RGBA8. 0 when it doesn't apply: the image keeps every level
+// (as RGBA8 when uneven, IsUnevenMipRgba8Astc).
+[[nodiscard]] u32 UnevenBcTailLevels(const ImageInfo& info) {
+    if (!g_uneven_bc_tail_trim.load(std::memory_order_relaxed) ||
+        !IsPixelFormatASTC(info.format) || info.type != ImageType::e2D || info.size.depth != 1 ||
+        info.num_samples != 1 || info.resources.levels <= 1 ||
+        Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
+        Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed) {
+        return 0;
+    }
+    const u32 even = EvenBlockMipCount(info);
+    if (even >= static_cast<u32>(info.resources.levels) || even < 2) {
+        return 0;
+    }
+    constexpr u32 MaxSmallestLevel = 64;
+    if ((std::max)(info.size.width >> (even - 1), info.size.height >> (even - 1)) >
+        MaxSmallestLevel) {
+        return 0;
+    }
+    // Huge arrays keep their own path (IsHugeAstcArray: RGBA8 with trimmed top levels).
+    u64 rgba8_bytes = 0;
+    for (u32 level = 0; level < static_cast<u32>(info.resources.levels); ++level) {
+        rgba8_bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                       (std::max)(info.size.height >> level, 1U) * 4;
+    }
+    if (rgba8_bytes * static_cast<u64>(info.resources.layers) > (u64{1} << 30)) {
+        return 0;
+    }
+    return even;
+}
+
 [[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
-    return VideoCommon::HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
-                                          static_cast<u32>(info.resources.levels));
+    const u32 levels =
+        VideoCommon::HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                       static_cast<u32>(info.resources.levels));
+    if (IsPixelFormatASTC(info.format)) {
+        if (const u32 trimmed = UnevenBcTailLevels(info); trimmed != 0) {
+            return (std::min)(levels, trimmed);
+        }
+    }
+    return levels;
 }
 
 [[nodiscard]] std::span<const VideoCommon::ImageCopy> HostImageCopies(
@@ -240,7 +303,9 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
-    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+    // Uneven chains that UnevenBcTailLevels can cut short stay BC with fewer levels instead.
+    return HasUnevenBlockMips(info) && UnevenBcTailLevels(info) == 0 &&
+           !IsHugeAstcArray(device, info);
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -1302,6 +1367,21 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       resolution{Settings::values.resolution_info} {
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    {
+        const VkDriverIdKHR id = device.GetDriverID();
+        const bool amd = id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                         id == VK_DRIVER_ID_MESA_RADV;
+        const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_TRIM");
+        const bool enabled = value == nullptr || std::atoi(value) != 0;
+        g_uneven_bc_tail_trim.store(amd && enabled && !device.IsOptimalAstcSupported(),
+                                    std::memory_order_relaxed);
+        if (amd && !device.IsOptimalAstcSupported()) {
+            LOG_INFO(Render_Vulkan,
+                     "ASTC with uneven BC block mips: {} (EDEN_NX2_UNEVEN_BC_TRIM)",
+                     enabled ? "BC with the even levels when they reach 64 texels, else RGBA8"
+                             : "RGBA8");
+        }
+    }
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
@@ -3054,6 +3134,16 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                              "{} images so far",
                              info.size.width, info.size.height, info.resources.layers,
                              info.resources.levels, count);
+                }
+            } else if (const u32 trimmed = UnevenBcTailLevels(info); trimmed != 0) {
+                static std::atomic<u32> trimmed_images{0};
+                const u32 count = ++trimmed_images;
+                if (count <= 4 || (count & (count - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "ASTC {}x{}x{} with {} levels kept as BC with {} levels (uneven BC "
+                             "block mips below), {} images so far",
+                             info.size.width, info.size.height, info.resources.layers,
+                             info.resources.levels, trimmed, count);
                 }
             }
             break;
