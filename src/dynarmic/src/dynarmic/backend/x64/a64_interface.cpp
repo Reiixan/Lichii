@@ -255,12 +255,7 @@ private:
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
-        CodePtr entrypoint;
-        {
-            const ::Common::Nx2GuestTrace::StallScope trace{::Common::Nx2GuestTrace::Stall::JitCompile,
-                                                          ::Common::Nx2GuestTrace::CoreState::Jit};
-            entrypoint = CompileBlock(descriptor, false);
-        }
+        const CodePtr entrypoint = CompileBlock(descriptor, false);
         conf.callbacks->BlockCompiled(descriptor.Value());
         return entrypoint;
     }
