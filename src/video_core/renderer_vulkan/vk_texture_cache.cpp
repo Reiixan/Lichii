@@ -4933,11 +4933,33 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     is_rescaled = is_rescaled_;
     const auto& resolution = runtime.resolution;
 
+    // A render target the texture cache had no memory for is looked up as the null image view
+    // (TextureCache::JoinImages skips the image), which has no handle on devices with
+    // nullDescriptor: as an attachment, AMD's driver read through it and crashed in
+    // vkCreateFramebuffer when the 8 GB card ran out of memory (Ocarina of Time, RX 6650 XT).
+    // Such a target is left out as an unbound one is, for the draws until the image fits.
+    const auto unbacked = [](const ImageView* view) {
+        if (view == nullptr || view->RenderTarget() != VK_NULL_HANDLE) {
+            return false;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Render target without an image view ({}x{}, format {}) left out of the "
+                        "framebuffer",
+                        view->size.width, view->size.height, static_cast<u32>(view->format));
+        }
+        return true;
+    };
+    if (unbacked(depth_buffer)) {
+        depth_buffer = nullptr;
+    }
+
     u32 width = (std::numeric_limits<u32>::max)();
     u32 height = (std::numeric_limits<u32>::max)();
     for (size_t index = 0; index < NUM_RT; ++index) {
         const ImageView* const color_buffer = color_buffers[index];
-        if (!color_buffer) {
+        if (!color_buffer || unbacked(color_buffer)) {
             renderpass_key.color_formats[index] = PixelFormat::Invalid;
             continue;
         }
