@@ -1890,6 +1890,18 @@ void Device::RemoveUnsuitableExtensions() {
     // disk cache of their own (DriverCachesPipelines) that don't prefer their internal cache: the
     // store would only duplicate it there (PipelineBinaries). NVIDIA 610.88 also gave ~7.8 MB of
     // blobs a pipeline: one Ocarina of Time session stored 2.3 GB.
+    // AMD's proprietary driver is the exception: its disk cache never keeps graphics pipelines
+    // with VK_DYNAMIC_STATE_VERTEX_INPUT_EXT (#770), so an RX 6650 XT rebuilt ~5,800 boot
+    // pipelines at ~120 ms each (12-15 min to the first frame) at every boot, and turning dynamic
+    // vertex input off lost the device on the first pipeline. The store keeps them instead.
+    // EDEN_NX2_AMD_PIPELINE_BINARY=0 leaves AMD to its driver's cache.
+    const bool amd_binaries = [this] {
+        if (properties.driver.driverID != VK_DRIVER_ID_AMD_PROPRIETARY) {
+            return false;
+        }
+        const char* const value = std::getenv("EDEN_NX2_AMD_PIPELINE_BINARY");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
     if (extensions.pipeline_binary) {
         LOG_INFO(Render_Vulkan,
                  "VK_KHR_pipeline_binary: pipelineBinaries {}, internal cache {}, prefers internal "
@@ -1901,7 +1913,8 @@ void Device::RemoveUnsuitableExtensions() {
     }
     extensions.pipeline_binary =
         features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
-        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache && !DriverCachesPipelines();
+        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache &&
+        (!DriverCachesPipelines() || amd_binaries);
     RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
                                        VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 
