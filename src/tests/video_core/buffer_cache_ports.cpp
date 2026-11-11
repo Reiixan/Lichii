@@ -88,6 +88,7 @@ struct Runtime {
     }
     void WaitSubmittedTick(u64) {}
     void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
+        REQUIRE(offset + size <= buffer.bytes.size());
         std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
     }
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
@@ -131,24 +132,10 @@ struct Runtime {
             upload_bytes += copy.size;
         }
     }
-    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
-                    bool) {
-        for (const auto& copy : copies) {
-            REQUIRE(copy.src_offset + copy.size <= src.bytes.size());
-            REQUIRE(copy.dst_offset + copy.size <= dst.bytes.size());
-            std::memcpy(dst.bytes.data() + copy.dst_offset, src.bytes.data() + copy.src_offset,
-                        copy.size);
-        }
-    }
-    void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
-        REQUIRE(offset + size <= buffer.bytes.size());
-        std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
-    }
     void TickFrame(Common::SlotVector<Buffer>&) {}
     u64 GetDeviceMemoryUsage() const {
         return 0;
     }
-    void FreeDeferredStagingBuffer(Staging&) {}
     void Finish() {
         if (before_completion) {
             before_completion();

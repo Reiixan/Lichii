@@ -33,7 +33,8 @@ const VkBaseInStructure* FindNext(const void* next, VkStructureType type) {
 /// AMD's proprietary driver keeps no graphics pipeline with dynamic vertex input in its own disk
 /// cache, so the store is all there is: a shader precache stores every cached pipeline (~600 MB
 /// for the green-hat kid adventure) and the default 384 MiB compaction dropped a third of it.
-/// AMD keeps up to 1 GiB (EDEN_NX2_DRIVER_BLOBS_MIB sets it on any driver).
+/// AMD compacts past 1 GiB, and never drops what a session used or wrote below 4 GiB, so a game
+/// that needs more keeps it (EDEN_NX2_DRIVER_BLOBS_MIB sets the 1 GiB on any driver).
 ShaderCacheV2::DriverBlobOptions BlobOptions(const Device& device) {
     ShaderCacheV2::DriverBlobOptions options{};
     u64 max_mib = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ? 1024 : 0;
@@ -43,7 +44,8 @@ ShaderCacheV2::DriverBlobOptions BlobOptions(const Device& device) {
     if (max_mib > options.max_bytes >> 20) {
         options.max_bytes = max_mib << 20;
         options.target_bytes = options.max_bytes / 8 * 7;
-        options.ceiling_bytes = options.max_bytes / 2 * 3;
+        options.session_cap_bytes = (std::max)(options.max_bytes, u64{4} << 30);
+        options.ceiling_bytes = options.session_cap_bytes;
     }
     return options;
 }
