@@ -3305,6 +3305,16 @@ void RasterizerVulkan::TickFrame() {
         ReportFastDraws();
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Frame);
     }
+    {
+        // What the device heaps, the host heap and the process hold, once a minute: the trace
+        // was only written when an allocation failed, which left nothing to compare it with.
+        static std::chrono::steady_clock::time_point next_memory_trace{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_memory_trace) {
+            next_memory_trace = now + std::chrono::seconds{60};
+            LogMemoryTrace(device);
+        }
+    }
     frame_dump.TickFrame();
     ++render_trace_frame;
     render_trace_draws = 0;

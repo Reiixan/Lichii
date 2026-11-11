@@ -4277,7 +4277,22 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // Mario Kart World's lighting passes read past 8 MiB from theirs: capped there, the
             // reads came back zero and lit land and characters too dark. Written bindings keep
             // a cap: a write marks the whole binding GPU-modified.
-            const bool native_compute = native_pointer && compute;
+            //
+            // Ocarina of Time is left at the 8 MiB cap. Its compute programs' pointer reaches
+            // 1 GiB of mapped memory, bound about 170 times a second: one 1034 MiB buffer in
+            // device memory on every card (RX 6650 XT 8 GB and RTX 4050 6 GB alike), made while a
+            // save loads. On the 8 GB card the heap filled 2.5 s later and images and buffers
+            // were refused; the first 58 MiB of the range are not even mapped. The game drew
+            // right with the cap. EDEN_NX2_COMPUTE_REACH=1 lifts the cap there too, =0 caps
+            // every title.
+            static const int compute_reach = [] {
+                const char* const value = std::getenv("EDEN_NX2_COMPUTE_REACH");
+                return value == nullptr ? -1 : (value[0] != '0' ? 1 : 0);
+            }();
+            constexpr u64 ocarina_of_time_id = 0x0400486024DEC000ULL;
+            const bool reach_allowed =
+                compute_reach < 0 ? program_id != ocarina_of_time_id : compute_reach != 0;
+            const bool native_compute = native_pointer && compute && reach_allowed;
             if ((table_pointer || native_compute) && !is_written) {
                 const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
                 const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));

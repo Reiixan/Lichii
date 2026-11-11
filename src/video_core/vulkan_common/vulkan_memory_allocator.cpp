@@ -113,7 +113,8 @@ namespace {
                                        const VkBufferCreateInfo& ci, MemoryUsage usage,
                                        VmaAllocationCreateInfo alloc_ci, VkResult first,
                                        VkBuffer& handle, VmaAllocation& allocation,
-                                       VmaAllocationInfo& alloc_info) {
+                                       VmaAllocationInfo& alloc_info,
+                                       VkDeviceSize min_alignment = 1) {
         static std::atomic<u32> logged{};
         const u32 count = logged.fetch_add(1, std::memory_order_relaxed);
         if (count == 0) {
@@ -132,12 +133,13 @@ namespace {
             if (attempt != 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{50 * attempt});
             }
-            result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+            result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment,
+                                                  &handle, &allocation, &alloc_info);
             if (result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
                 VmaAllocationCreateInfo host_ci = alloc_ci;
                 host_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-                result =
-                    vmaCreateBuffer(allocator, &ci, &host_ci, &handle, &allocation, &alloc_info);
+                result = vmaCreateBufferWithAlignment(allocator, &ci, &host_ci, min_alignment,
+                                                      &handle, &allocation, &alloc_info);
             }
         }
         if (count < 16) {
@@ -624,8 +626,15 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    VkResult result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment,
+                                                   &handle, &allocation, &alloc_info);
+    if (result != VK_SUCCESS) {
+        // As in the overload above: these are the buffer cache's sparse-compatible buffers.
+        pressure_events.fetch_add(1, std::memory_order_relaxed);
+        result = CreateBufferUnderPressure(allocator, device, ci, usage, alloc_ci, result, handle,
+                                           allocation, alloc_info, min_alignment);
+    }
+    vk::Check(result);
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
