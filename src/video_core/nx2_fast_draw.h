@@ -72,6 +72,22 @@ inline std::atomic<bool> g_enabled{true};
 /// stride change then leaves the pipeline as it is.
 inline std::atomic<bool> g_dynamic_strides{false};
 
+/// Whether pipelines take vertex input as dynamic state (set by the pipeline cache): a vertex
+/// attribute format change that keeps what the pipeline key holds of it then leaves the pipeline
+/// as it is, and the draw sets the new formats on both paths (UpdateVertexInput).
+inline std::atomic<bool> g_dynamic_vertex_input{false};
+
+/// What a pipeline key holds of a vertex attribute format word (Maxwell3D::Regs::VertexAttribute)
+/// under dynamic vertex input, as FixedPipelineState::attribute_types: the class of its type
+/// (float, signed or unsigned integer), and nothing for a constant attribute.
+[[nodiscard]] constexpr u32 AttributeKeyBits(u32 format) {
+    constexpr std::array<u32, 8> classes{0, 1, 1, 2, 3, 1, 1, 1};
+    if (((format >> 6) & 1) != 0) {
+        return 0;
+    }
+    return classes[(format >> 27) & 7];
+}
+
 /// Tests only.
 inline void SetEnabledForTest(bool on) {
     g_enabled.store(on, std::memory_order_relaxed);

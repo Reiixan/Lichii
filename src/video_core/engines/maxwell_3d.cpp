@@ -419,6 +419,18 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
            (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
 }
 
+// Ocarina of Time rewrites vertex attribute formats between most draws (~21,000 a second in
+// Castle Town, attributes 1, 6, 8, 9 and 12-14), each of which sent the next draw to a full
+// resolve. Under dynamic vertex input the pipeline keys an attribute by its type class alone, and
+// the draw sets the formats again on both paths, so a write that keeps the class is a parameter.
+bool Maxwell3D::IsFastDrawAttributeFormat(u32 method, u32 previous, u32 value) {
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    return method - formats < Regs::NumVertexAttributes &&
+           FastDraw::g_dynamic_vertex_input.load(std::memory_order_relaxed) &&
+           FastDraw::AttributeKeyBits(previous) == FastDraw::AttributeKeyBits(value);
+}
+
 bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method >= cb_data && method < cb_data + Regs::NumCBData) {

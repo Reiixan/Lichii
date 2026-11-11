@@ -42,6 +42,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -733,6 +734,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_dynamic_vertex_input =
         device.IsExtVertexInputDynamicStateSupported() &&
         Settings::values.vertex_input_dynamic_state.GetValue();
+    // Vertex attribute format writes keep fast draws going under it (Maxwell3D::
+    // IsFastDrawAttributeFormat); EDEN_NX2_FAST_DRAW_ATTRIBS=0 ends them on every change as before.
+    {
+        const char* const value = std::getenv("EDEN_NX2_FAST_DRAW_ATTRIBS");
+        const bool on =
+            dynamic_features.has_dynamic_vertex_input && (value == nullptr || std::atoi(value) != 0);
+        VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.store(on, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "Fast draw: vertex attribute format changes {}",
+                 on ? "keep delta draws when the type class stays" : "end delta draws");
+    }
     dynamic_features.has_static_vertex_repack =
         StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
 
