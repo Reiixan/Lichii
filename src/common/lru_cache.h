@@ -52,10 +52,6 @@ public:
         Attach(item);
     }
 
-    TickType GetTick(size_t id) const {
-        return item_pool[id].tick;
-    }
-
     void Free(size_t id) {
         auto& item = item_pool[id];
         Detach(item);
