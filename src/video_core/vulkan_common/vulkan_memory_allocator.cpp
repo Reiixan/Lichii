@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <iterator>
 #include <string>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -97,6 +100,56 @@ namespace {
                 return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    }
+
+    /// A buffer the driver refused. vk::Check throws for it on the GPU thread, where nothing
+    /// catches it, and the session ends: Ocarina of Time loading an area on an 8 GB RX 6650 XT
+    /// with the system's commit nearly used up (a staging buffer once, a vertex buffer another
+    /// time, neither over the device budget). Tries again for most of a second, since Windows
+    /// grows a system-managed page file when the commit limit is reached and other threads free
+    /// memory, and puts a device-local buffer in host memory when that is what there is. Each
+    /// call counts as memory pressure, which makes the texture cache keep more free.
+    VkResult CreateBufferUnderPressure(VmaAllocator allocator, const Device& device,
+                                       const VkBufferCreateInfo& ci, MemoryUsage usage,
+                                       VmaAllocationCreateInfo alloc_ci, VkResult first,
+                                       VkBuffer& handle, VmaAllocation& allocation,
+                                       VmaAllocationInfo& alloc_info) {
+        static std::atomic<u32> logged{};
+        const u32 count = logged.fetch_add(1, std::memory_order_relaxed);
+        if (count == 0) {
+            // What ran out: the device's heaps or the host's commit.
+            LogMemoryTrace(device);
+        }
+        if (count < 16) {
+            LOG_ERROR(Render_Vulkan, "Buffer of {} bytes (usage {}) failed: {}; trying again",
+                      ci.size, static_cast<u32>(usage), static_cast<int>(first));
+        }
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        constexpr int Attempts = 6;
+        VkResult result = first;
+        int attempt = 0;
+        for (; attempt < Attempts && result != VK_SUCCESS; ++attempt) {
+            if (attempt != 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{50 * attempt});
+            }
+            result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+            if (result != VK_SUCCESS && usage == MemoryUsage::DeviceLocal) {
+                VmaAllocationCreateInfo host_ci = alloc_ci;
+                host_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                result =
+                    vmaCreateBuffer(allocator, &ci, &host_ci, &handle, &allocation, &alloc_info);
+            }
+        }
+        if (count < 16) {
+            if (result == VK_SUCCESS) {
+                LOG_WARNING(Render_Vulkan, "Buffer of {} bytes made on attempt {}", ci.size,
+                            attempt);
+            } else {
+                LOG_ERROR(Render_Vulkan, "Buffer of {} bytes failed {} more times: {}", ci.size,
+                          attempt, static_cast<int>(result));
+            }
+        }
+        return result;
     }
 } // namespace
 
@@ -508,6 +561,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             VmaAllocationCreateInfo relaxed = alloc_ci;
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
+        if (result != VK_SUCCESS) {
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+            result = CreateBufferUnderPressure(allocator, device, ci, usage, alloc_ci, result,
+                                               handle, allocation, alloc_info);
         }
         vk::Check(result);
     }
