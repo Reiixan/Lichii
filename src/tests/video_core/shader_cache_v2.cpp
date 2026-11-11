@@ -943,8 +943,12 @@ TEST_CASE("Shader cache v2: a program whose texture bound buffer alone moved is 
 }
 TEST_CASE("Shader cache v2: an older Vulkan cache and its used list are migrated",
           "[video_core][shader_cache_v2]") {
+    // An older compatible version, or the current one where there is none (this fork's)
+    constexpr u32 Version = VideoCommon::CompatibleVulkanPipelineCacheVersions.empty()
+                                ? VideoCommon::VulkanPipelineCacheVersion
+                                : VideoCommon::CompatibleVulkanPipelineCacheVersions.front();
     TempDir temp;
-    const auto legacy = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto legacy = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", Version);
     const auto log_file = temp.path / std::string{V2::FileName};
     TestEnvironment fragment{Shader::Stage::Fragment};
     TestEnvironment other_fragment{Shader::Stage::Fragment, 1};
@@ -956,15 +960,15 @@ TEST_CASE("Shader cache v2: an older Vulkan cache and its used list are migrated
     const auto old_driver = TestGraphicsKey(0x1111, 100);
     const auto new_driver = TestGraphicsKey(0x1111, 101);
     const auto second = TestGraphicsKey(0x3333, 101);
-    VideoCommon::SerializePipeline(old_driver, fragment_envs, legacy, 53, ReadProperties);
-    VideoCommon::SerializePipeline(TestComputeKey(0x2222), compute_envs, legacy, 53, ReadProperties);
-    VideoCommon::SerializePipeline(new_driver, other_envs, legacy, 53, ReadProperties);
-    VideoCommon::SerializePipeline(second, fragment_envs, legacy, 53, ReadProperties);
-    VideoCommon::SerializePipeline(TestComputeKey(0x2222), compute_envs, legacy, 53, ReadProperties);
+    VideoCommon::SerializePipeline(old_driver, fragment_envs, legacy, Version, ReadProperties);
+    VideoCommon::SerializePipeline(TestComputeKey(0x2222), compute_envs, legacy, Version, ReadProperties);
+    VideoCommon::SerializePipeline(new_driver, other_envs, legacy, Version, ReadProperties);
+    VideoCommon::SerializePipeline(second, fragment_envs, legacy, Version, ReadProperties);
+    VideoCommon::SerializePipeline(TestComputeKey(0x2222), compute_envs, legacy, Version, ReadProperties);
     {
         // The used list: the new-driver pipeline last session, the second one three ago, and one
         // not in the cache
-        std::ofstream used(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_used", 53),
+        std::ofstream used(VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_used", Version),
                            std::ios::binary);
         const u32 magic = Vulkan::UsedPipelinesMagic;
         const u32 count = 3;
@@ -979,7 +983,7 @@ TEST_CASE("Shader cache v2: an older Vulkan cache and its used list are migrated
     const auto legacy_bytes = ReadAll(legacy);
 
     const auto migration = Vulkan::MigrateLegacyPipelineCache(temp.path, log_file, 16);
-    REQUIRE(migration.version == 53u);
+    REQUIRE(migration.version == Version);
     REQUIRE(migration.graphics == 2);
     REQUIRE(migration.compute == 1);
     REQUIRE(migration.collapsed == 2);
@@ -1020,9 +1024,9 @@ TEST_CASE("Shader cache v2: an older Vulkan cache and its used list are migrated
                                                {Vulkan::GraphicsRecordKey(second), 1}});
     const auto migrated = V2::DecodeMigrated(kinds[RecordKind::Migrated][0]->payload);
     REQUIRE(migrated.has_value());
-    REQUIRE(migrated->source == "vulkan.fork-v53.bin");
+    REQUIRE(migrated->source == legacy.filename().string());
     REQUIRE(migrated->source_size == legacy_bytes.size());
-    REQUIRE(migrated->source_version == 53);
+    REQUIRE(migrated->source_version == Version);
 
     // Once only, and never over a log
     const auto log_bytes = ReadAll(log_file);
@@ -1030,6 +1034,9 @@ TEST_CASE("Shader cache v2: an older Vulkan cache and its used list are migrated
     REQUIRE(ReadAll(log_file) == log_bytes);
 
     // The newest version first
+    if (Version == VideoCommon::VulkanPipelineCacheVersion) {
+        return;
+    }
     const auto newer = VideoCommon::VersionedPipelineCachePath(
         temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
     VideoCommon::SerializePipeline(second, fragment_envs, newer,

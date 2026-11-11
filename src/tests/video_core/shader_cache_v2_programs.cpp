@@ -399,6 +399,8 @@ struct NativeComputeFixture {
         memory->BindRasterizer(&rasterizer);
         memory->Map(Base, 0x10000, 0x10000, Tegra::PTEKind::PITCH, true);
         compute.emplace(*memory);
+        // As the GPU does: native compute environments ask the rasterizer about tensor programs
+        compute->BindRasterizer(&rasterizer);
         compute->SetNativeMacroMode(&macros, {});
         auto& qmd = compute->launch_description;
         qmd.const_buffer_enable_mask.Assign(1);
