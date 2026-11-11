@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -27,6 +28,24 @@ const VkBaseInStructure* FindNext(const void* next, VkStructureType type) {
         }
     }
     return nullptr;
+}
+
+/// AMD's proprietary driver keeps no graphics pipeline with dynamic vertex input in its own disk
+/// cache, so the store is all there is: a shader precache stores every cached pipeline (~600 MB
+/// for the green-hat kid adventure) and the default 384 MiB compaction dropped a third of it.
+/// AMD keeps up to 1 GiB (EDEN_NX2_DRIVER_BLOBS_MIB sets it on any driver).
+ShaderCacheV2::DriverBlobOptions BlobOptions(const Device& device) {
+    ShaderCacheV2::DriverBlobOptions options{};
+    u64 max_mib = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ? 1024 : 0;
+    if (const char* const value = std::getenv("EDEN_NX2_DRIVER_BLOBS_MIB")) {
+        max_mib = std::strtoull(value, nullptr, 10);
+    }
+    if (max_mib > options.max_bytes >> 20) {
+        options.max_bytes = max_mib << 20;
+        options.target_bytes = options.max_bytes / 8 * 7;
+        options.ceiling_bytes = options.max_bytes / 2 * 3;
+    }
+    return options;
 }
 
 /// Libraries, and create infos that already chain binaries or flags of their own, are left alone.
@@ -214,7 +233,7 @@ std::unique_ptr<PipelineBinaries> PipelineBinaries::Open(const Device& device,
 
 PipelineBinaries::PipelineBinaries(const Device& device_, std::filesystem::path file,
                                    const ShaderCacheV2::DeviceIdentity& identity)
-    : device{device_}, store{std::move(file), identity} {}
+    : device{device_}, store{std::move(file), identity, BlobOptions(device_)} {}
 
 vk::Pipeline PipelineBinaries::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci,
                                                       VkPipelineCache cache, u64 key) {
