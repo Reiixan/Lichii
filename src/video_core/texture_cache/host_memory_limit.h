@@ -17,6 +17,32 @@ constexpr u64 HostCommitReserve = u64{2} << 30;
 /// it the collector only deletes and decodes the same textures again.
 constexpr u64 MinHostCriticalMemory = u64{3} << 30;
 
+/// Cards whose device memory figure (Device::GetDeviceLocalMemory: the budget at boot less 1/8)
+/// is under this are 8 GB cards and smaller.
+constexpr u64 SmallCardMemory = u64{7} << 30;
+
+/// The most device memory the collector lets the texture cache fill before it collects in
+/// earnest on a small card. At 5 GiB an RX 6650 XT (6.3 GiB figure, a 6.0-7.1 GB budget) ran
+/// out entering a busy town in the green-hat kid adventure: device memory went 3.9 -> 5.6 GB in
+/// 11 s, a 288 MiB shadow map ended up in host memory and the driver refused a staging buffer.
+/// At 4 GiB (expected 3.25 GiB) the same town and the zones past it ran 26 minutes with device
+/// memory at 3.4-4.1 GB, no memory pressure, the same fps and ~40% more ASTC decodes.
+constexpr u64 SmallCardCriticalMemory = u64{4} << 30;
+
+/// The same on larger cards, where 5/8 of the driver's budget is used when that is more: at
+/// 5 GiB title 1's races recreate and upload ~8 MiB of render targets a frame (16 GB card: 53 ->
+/// 59 fps at 10 GiB).
+constexpr u64 LargeCardCriticalMemory = u64{5} << 30;
+
+/// Cap on the collector's critical threshold for a card with `device_local` memory (Eden's
+/// figure) and the driver's `budget` (0 when unknown).
+constexpr u64 MaxCriticalMemory(u64 device_local, u64 budget) {
+    if (device_local < SmallCardMemory) {
+        return SmallCardCriticalMemory;
+    }
+    return (std::max)(LargeCardCriticalMemory, budget / 8 * 5);
+}
+
 /// The most device memory the texture cache may hold before it collects in earnest, as host
 /// memory allows it. Windows charges device memory to the system's commit limit (RAM plus the
 /// page files) like any other memory, since each allocation has a backing store there. A 16 GB

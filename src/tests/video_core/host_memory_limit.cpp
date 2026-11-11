@@ -50,6 +50,21 @@ TEST_CASE("The host memory bound does not wrap", "[video_core][texture_cache][ho
     REQUIRE(VideoCommon::HostCriticalMemory(max, max) == max - VideoCommon::HostCommitReserve);
 }
 
+TEST_CASE("8 GB cards collect from 4 GiB", "[video_core][texture_cache][host_memory_limit]") {
+    // RX 6650 XT: a 6.31 GiB device memory figure, budget 6.0-7.1 GB.
+    REQUIRE(VideoCommon::MaxCriticalMemory(6463 * MiB, 7 * GiB) == 4 * GiB);
+    REQUIRE(VideoCommon::MaxCriticalMemory(6463 * MiB, 0) == 4 * GiB);
+    REQUIRE(VideoCommon::MaxCriticalMemory(4 * GiB, 5 * GiB) == 4 * GiB);
+}
+
+TEST_CASE("Larger cards collect from 5 GiB or 5/8 of their budget",
+          "[video_core][texture_cache][host_memory_limit]") {
+    // 10 GB and 12 GB cards: the figure is capped at 7 GiB without aggressive VRAM use.
+    REQUIRE(VideoCommon::MaxCriticalMemory(7 * GiB, 0) == 5 * GiB);
+    REQUIRE(VideoCommon::MaxCriticalMemory(7 * GiB, 8 * GiB) == 5 * GiB);
+    REQUIRE(VideoCommon::MaxCriticalMemory(7 * GiB, 16 * GiB) == 10 * GiB);
+}
+
 TEST_CASE("The system's commit room is reported where there is a commit limit",
           "[video_core][texture_cache][host_memory_limit]") {
     const std::optional<u64> room = Common::GetSystemCommitRoom();
