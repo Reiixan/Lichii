@@ -105,10 +105,16 @@ namespace {
     /// A buffer the driver refused. vk::Check throws for it on the GPU thread, where nothing
     /// catches it, and the session ends: Ocarina of Time loading an area on an 8 GB RX 6650 XT
     /// with the system's commit nearly used up (a staging buffer once, a vertex buffer another
-    /// time, neither over the device budget). Tries again for most of a second, since Windows
+    /// time, neither over the device budget). Tries again for up to RetrySeconds, since Windows
     /// grows a system-managed page file when the commit limit is reached and other threads free
     /// memory, and puts a device-local buffer in host memory when that is what there is. Each
     /// call counts as memory pressure, which makes the texture cache keep more free.
+    ///
+    /// 750 ms was not always enough: entering Ocarina of Time's Castle Town with the device heap
+    /// full (5659 of 5659 MiB) and 232 MiB of system commit left (37742 of 37974 MiB), a 32 MiB
+    /// upload buffer was refused six times in that long and the session ended. The page file had
+    /// grown by 1 GiB a minute earlier and by 4.8 GiB in another session: it does grow, a step
+    /// at a time. A freeze of some seconds is better than the abort.
     VkResult CreateBufferUnderPressure(VmaAllocator allocator, const Device& device,
                                        const VkBufferCreateInfo& ci, MemoryUsage usage,
                                        VmaAllocationCreateInfo alloc_ci, VkResult first,
@@ -126,12 +132,16 @@ namespace {
                       ci.size, static_cast<u32>(usage), static_cast<int>(first));
         }
         alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        constexpr int Attempts = 6;
+        constexpr auto RetrySeconds = std::chrono::seconds{12};
+        const auto deadline = std::chrono::steady_clock::now() + RetrySeconds;
         VkResult result = first;
         int attempt = 0;
-        for (; attempt < Attempts && result != VK_SUCCESS; ++attempt) {
+        for (; result != VK_SUCCESS; ++attempt) {
             if (attempt != 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{50 * attempt});
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{(std::min)(50 * attempt, 250)});
             }
             result = vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment,
                                                   &handle, &allocation, &alloc_info);
