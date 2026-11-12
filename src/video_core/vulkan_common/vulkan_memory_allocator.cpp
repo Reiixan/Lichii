@@ -443,32 +443,34 @@ void MemoryAllocator::NoteHostPlacement(VmaAllocation allocation, VkDeviceSize s
         return;
     }
     const u64 total = spilled_bytes.fetch_add(size, std::memory_order_relaxed) + size;
-    // Each pressure event the texture cache sees keeps 512 MiB more free (up to half the
-    // budget), and a spill lasts for many allocations while it evicts: count one every couple
-    // of seconds, not one per allocation. EDEN_NX2_SPILL_PRESSURE=0 only logs.
-    static const bool count_pressure = [] {
+    // Not a pressure event: each of those keeps 512 MiB more free, and counting spills as such
+    // (one every 2 s) took the margin to 1.5 GiB while a scene loaded on that laptop and kept
+    // the cache under the scene's working set for minutes (ASTC decodes 55/s -> 950/s). The
+    // texture cache takes the bytes and sizes its answer to them (TextureCache::TickFrame).
+    // EDEN_NX2_SPILL_PRESSURE=0 only logs.
+    static const bool report = [] {
         const char* const value = std::getenv("EDEN_NX2_SPILL_PRESSURE");
         return !(value != nullptr && value[0] == '0');
     }();
+    if (report) {
+        spill_pending.fetch_add(size, std::memory_order_relaxed);
+    }
+    // The first ones, then at most one every 2 s.
     constexpr s64 Interval = std::chrono::nanoseconds{std::chrono::seconds{2}}.count();
     const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
-    bool counted = false;
-    if (count_pressure) {
-        s64 last = last_spill_pressure.load(std::memory_order_relaxed);
-        if (now - last >= Interval &&
-            last_spill_pressure.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
-            pressure_events.fetch_add(1, std::memory_order_relaxed);
-            counted = true;
-        }
+    bool log = spill_logged.fetch_add(1, std::memory_order_relaxed) < 32;
+    if (!log) {
+        s64 last = last_spill_log.load(std::memory_order_relaxed);
+        log = now - last >= Interval &&
+              last_spill_log.compare_exchange_strong(last, now, std::memory_order_relaxed);
     }
-    if (spill_logged.fetch_add(1, std::memory_order_relaxed) < 32 || counted) {
+    if (log) {
         LOG_WARNING(Render_Vulkan,
                     "Device-local {} of {} KiB placed in host memory (device heap over budget; "
-                    "{} MiB so far){}",
-                    is_image ? "image" : "buffer", size >> 10, total >> 20,
-                    counted ? ", counted as memory pressure" : "");
+                    "{} MiB so far)",
+                    is_image ? "image" : "buffer", size >> 10, total >> 20);
     }
 }
 

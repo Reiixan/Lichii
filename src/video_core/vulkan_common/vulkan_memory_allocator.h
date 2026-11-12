@@ -142,6 +142,13 @@ namespace Vulkan {
             return failed_images.load(std::memory_order_relaxed);
         }
 
+        /// Device-local bytes VMA placed in host memory (device heap over its budget) since the
+        /// last call, on a discrete GPU. Not a pressure event: the texture cache sizes its own
+        /// answer to how much spilled (TextureCache::TickFrame).
+        u64 TakeSpilledBytes() const noexcept {
+            return spill_pending.exchange(0, std::memory_order_relaxed);
+        }
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
@@ -179,7 +186,7 @@ namespace Vulkan {
 
         /// A device-local image or buffer that VMA quietly placed in host memory because the
         /// device heap was over its budget (VMA picks another memory type instead of failing).
-        /// Counts as memory pressure, at most once every few seconds.
+        /// Adds its size to the bytes TakeSpilledBytes hands to the texture cache.
         void NoteHostPlacement(VmaAllocation allocation, VkDeviceSize size, bool is_image) const;
 
         const Device &device;                              ///< Device handle.
@@ -189,9 +196,10 @@ namespace Vulkan {
         u32 valid_memory_types{~0u};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::atomic<u32> failed_images{0};
-        /// steady_clock time (ns) of the last host placement counted as pressure.
-        mutable std::atomic<s64> last_spill_pressure{0};
-        mutable std::atomic<u64> spilled_bytes{0};
+        /// steady_clock time (ns) of the last host placement logged after the first ones.
+        mutable std::atomic<s64> last_spill_log{0};
+        mutable std::atomic<u64> spilled_bytes{0};   ///< Since the start of the session
+        mutable std::atomic<u64> spill_pending{0};   ///< Since the last TakeSpilledBytes
         mutable std::atomic<u32> spill_logged{0};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
