@@ -177,6 +177,11 @@ namespace Vulkan {
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                vk::Image &image) const;
 
+        /// A device-local image or buffer that VMA quietly placed in host memory because the
+        /// device heap was over its budget (VMA picks another memory type instead of failing).
+        /// Counts as memory pressure, at most once every few seconds.
+        void NoteHostPlacement(VmaAllocation allocation, VkDeviceSize size, bool is_image) const;
+
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.
@@ -184,6 +189,10 @@ namespace Vulkan {
         u32 valid_memory_types{~0u};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::atomic<u32> failed_images{0};
+        /// steady_clock time (ns) of the last host placement counted as pressure.
+        mutable std::atomic<s64> last_spill_pressure{0};
+        mutable std::atomic<u64> spilled_bytes{0};
+        mutable std::atomic<u32> spill_logged{0};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;
