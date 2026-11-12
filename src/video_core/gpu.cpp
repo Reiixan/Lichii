@@ -691,4 +691,18 @@ bool MayHoldGpuWrites(DAddr addr, u64 size) {
            Tegra::Nx2MayBeGpuWritten(addr, size);
 }
 
+bool CollectsGuestWriteUnasked(DAddr addr, u64 size) {
+    static const int mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_GUEST_WRITE_COLLECT");
+        const int parsed =
+            value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 2;
+        LOG_INFO(HW_GPU, "EDEN_NX2_GUEST_WRITE_COLLECT={}", parsed);
+        return parsed;
+    }();
+    if (mode == 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    return mode >= 2 || !Tegra::Nx2MayBeGpuWritten(addr, size);
+}
+
 } // namespace VideoCore

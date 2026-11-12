@@ -980,9 +980,11 @@ struct Memory::Impl {
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
-                // Short circuit the need to check for address/size
+                // Short circuit the need to check for address/size. Without OnCPUWrite's cache
+                // mutexes when VideoCore::CollectsGuestWriteUnasked says so.
                 auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
+                    && (VideoCore::CollectsGuestWriteUnasked(address, size) ||
+                        system.GPU().OnCPUWrite(address, size));
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {

@@ -33,6 +33,16 @@ inline std::atomic<u32> g_read_downloads{};
 /// be included here, since the Qt frontend reaches this header and its `slots` macro breaks it.
 [[nodiscard]] bool MayHoldGpuWrites(DAddr addr, u64 size);
 
+/// Whether a guest write of cached memory is collected for the GPU thread without asking
+/// OnCPUWrite (port of Fritchii's EXP35). OnCPUWrite takes the buffer and texture caches'
+/// mutexes, which the split's back holds through each draw: guest cores at Castle Town spent
+/// ~4% of their busy time, and up to 5-6 ms per frame in close-camera dips, waiting for them.
+/// A collected write gets the same WriteMemory/InvalidateRegion work on the GPU thread at its
+/// next InvalidateGPUCache (OnCacheInvalidations), before each draw, dispatch and clear.
+/// EDEN_NX2_GUEST_WRITE_COLLECT: 0 = ask OnCPUWrite as before, 1 = collect only pages no GPU
+/// write ever marked, 2 (default) = every page. Switch 2 titles only.
+[[nodiscard]] bool CollectsGuestWriteUnasked(DAddr addr, u64 size);
+
 /// Whether such a download may still land over [addr, addr + size): what a write to guest memory
 /// from the GPU's side asks before FinishRead, on any thread, without the buffer cache's lock.
 /// The downloads take only GPU-modified bytes, and Switch 2 titles mark their pages
