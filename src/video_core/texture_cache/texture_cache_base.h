@@ -216,6 +216,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     };
     std::deque<TransientTarget> transient_targets;
     u64 transient_evictions{};
+    u64 superseded_evictions{}; ///< Of them, superseded targets deleted without memory pressure
     u64 logged_transient_evictions{};
     /// Image made by the latest JoinImages call; FindRenderTargetView uses it to tell a target it
     /// just created from one that already existed.

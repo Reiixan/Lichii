@@ -414,14 +414,43 @@ void TextureCache<P>::EvictDeadRenderTargets() {
     static constexpr u32 MaxChecks = 4;
     // Waiting list size kept while the cache is under its expected size.
     static constexpr size_t MaxWaiting = 8192;
-    if (total_used_memory <= expected_memory) {
-        if (transient_targets.size() > MaxWaiting) {
-            transient_targets.erase(transient_targets.begin(),
-                                    transient_targets.begin() +
-                                        static_cast<std::ptrdiff_t>(transient_targets.size() - MaxWaiting));
-        }
+    // Under the expected size too, a dead target goes once it has been unused this long and a
+    // newer image of another shape covers its memory: the game reused that memory for another
+    // layout, so the old contents have no reader left. Fritchii's EXP58 measured this in Castle
+    // Town (device memory 7.8-10.5 -> 5.2-5.7 GB, no more collector bursts evicting live
+    // textures, worst frames 140-180 -> 30-48 ms). EDEN_NX2_SUPERSEDED_TARGETS=0 turns it off.
+    static constexpr u64 SupersededFrames = 60;
+    static const bool superseded_sweep = [] {
+        const char* const value = std::getenv("EDEN_NX2_SUPERSEDED_TARGETS");
+        const bool enabled = value == nullptr || value[0] != '0';
+        LOG_INFO(HW_GPU, "EDEN_NX2_SUPERSEDED_TARGETS={}", enabled ? 1 : 0);
+        return enabled;
+    }();
+    if (transient_targets.size() > MaxWaiting) {
+        transient_targets.erase(transient_targets.begin(),
+                                transient_targets.begin() +
+                                    static_cast<std::ptrdiff_t>(transient_targets.size() - MaxWaiting));
+    }
+    if (total_used_memory <= expected_memory && !superseded_sweep) {
         return;
     }
+    const auto superseded = [this](ImageId image_id, const Image& image) {
+        const u64 shape = RtShapeKey(image);
+        const u64 touched = lru_cache.GetTick(image.lru_index);
+        bool found = false;
+        ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
+                             [&](ImageId other_id, Image& other) {
+                                 if (other_id == image_id ||
+                                     False(other.flags & ImageFlagBits::Registered) ||
+                                     RtShapeKey(other) == shape ||
+                                     lru_cache.GetTick(other.lru_index) <= touched) {
+                                     return false;
+                                 }
+                                 found = true;
+                                 return true;
+                             });
+        return found;
+    };
     u32 evicted = 0;
     // Shapes the game read back after an early deletion are written back to guest memory first,
     // at most this many a frame; the rest wait for a later frame.
@@ -429,11 +458,13 @@ void TextureCache<P>::EvictDeadRenderTargets() {
     u32 saved = 0;
     for (size_t budget = transient_targets.size(); budget != 0 && !transient_targets.empty();
          --budget) {
-        if (evicted >= MaxEvictionsPerFrame || total_used_memory <= expected_memory) {
+        const bool pressure = total_used_memory > expected_memory;
+        if (evicted >= MaxEvictionsPerFrame || (!pressure && !superseded_sweep)) {
             break;
         }
+        const u64 dead_frames = pressure ? DeadTargetFrames : SupersededFrames;
         TransientTarget entry = transient_targets.front();
-        if (frame_tick - entry.check_tick < DeadTargetFrames) {
+        if (frame_tick - entry.check_tick < dead_frames) {
             break;
         }
         transient_targets.pop_front();
@@ -447,7 +478,7 @@ void TextureCache<P>::EvictDeadRenderTargets() {
             continue;
         }
         const u64 last_use = lru_cache.GetTick(image.lru_index);
-        if (frame_tick - last_use < DeadTargetFrames ||
+        if (frame_tick - last_use < dead_frames ||
             True(image.flags & ImageFlagBits::IsDecoding)) {
             // Still in use: check again later; one used for long is a lasting target.
             if (++entry.survived < MaxChecks) {
@@ -457,6 +488,18 @@ void TextureCache<P>::EvictDeadRenderTargets() {
                 image.flags &= ~ImageFlagBits::TransientTarget;
             }
             continue;
+        }
+        if (!pressure) {
+            // Without pressure only a superseded target goes, and never one of the shapes kept
+            // for a later deletion under pressure (small ones, read-back shapes). Not superseded
+            // yet: looked at again later, as long as it waits in the list.
+            if (image.guest_size_bytes < MinEvictBytes ||
+                readback_shapes.contains(RtShapeKey(image)) || !superseded(entry.id, image)) {
+                entry.check_tick = frame_tick;
+                transient_targets.push_back(entry);
+                continue;
+            }
+            ++superseded_evictions;
         }
         if (image.guest_size_bytes < MinEvictBytes) {
             // Small targets (text and label boxes, sized to their contents) barely relieve memory
@@ -516,8 +559,10 @@ void TextureCache<P>::EvictDeadRenderTargets() {
         ++evicted;
     }
     if (frame_tick % 600 == 0 && transient_evictions != logged_transient_evictions) {
-        LOG_INFO(HW_GPU, "Dead render targets deleted early: {} so far, {} waiting",
-                 transient_evictions, transient_targets.size());
+        LOG_INFO(HW_GPU,
+                 "Dead render targets deleted early: {} so far ({} superseded without memory "
+                 "pressure), {} waiting",
+                 transient_evictions, superseded_evictions, transient_targets.size());
         LOG_INFO(HW_GPU, "Dead render targets: {} small ones and {} read-back shapes not "
                          "downloadable left to the collector, {} written back before deletion; "
                          "{} of {} images made over deleted pages were sampled before any draw, "
@@ -3520,10 +3565,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (!ClearCovers(width, height)) {
             return false;
         }
-        // The clear covers the framebuffer's render area, the smallest bound target.
+        // The clear covers the framebuffer's render area, the smallest bound target. Not for the
+        // clear's own depth target, which follows IsFullClear as an existing one does (its
+        // contents are dropped, the colour targets' sizes aside): Ocarina binds a 1920x1024
+        // depth buffer under 1280x720 colour, made every frame, and this rule uploaded its
+        // 7.5 MiB from guest memory each time (port of Fritchii's EXP56, 41.3 -> 43.8 fps in
+        // Castle Town). EDEN_NX2_DEPTH_CLEAR_NO_UPLOAD=0 turns it off.
+        static const bool depth_clear_no_upload = [] {
+            const char* const value = std::getenv("EDEN_NX2_DEPTH_CLEAR_NO_UPLOAD");
+            const bool enabled = value == nullptr || value[0] != '0';
+            LOG_INFO(HW_GPU, "EDEN_NX2_DEPTH_CLEAR_NO_UPLOAD={}", enabled ? 1 : 0);
+            return enabled;
+        }();
+        const bool depth_follows_full_clear =
+            depth_clear_no_upload && regs.zeta_enable && regs.zeta.Address() == gpu_addr;
         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
             const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            if (!depth_follows_full_clear && rt.Address() != 0 &&
+                rt.format != Tegra::RenderTargetFormat::NONE &&
                 (rt.width < width || rt.height < height)) {
                 return false;
             }
