@@ -563,6 +563,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v7
@@ -572,12 +573,28 @@ jobs:
 
       - name: Package release files
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir dist
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
           strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
+          # When the pattern matches a single artifact (a run that builds one platform),
+          # download-artifact unpacks it straight into artifacts/ instead of a folder named after
+          # it, and the loop below would zip its subfolders one by one. Put it back in its folder.
+          if ! compgen -G "artifacts/lichii-*-${GITHUB_SHA}/" > /dev/null; then
+            names=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+              --jq ".artifacts[].name | select(startswith(\"lichii-\") and endswith(\"-${GITHUB_SHA}\"))")
+            if [[ $(wc -l <<< "$names") -ne 1 || -z "$names" ]]; then
+              echo "Expected one artifact folder per platform, found: ${names:-none}"
+              exit 1
+            fi
+            staging=$(mktemp -d)
+            mv artifacts/* "$staging"/
+            mv "$staging" "artifacts/${names}"
+          fi
           for artifact in artifacts/*/; do
             name=$(basename "$artifact")
             if compgen -G "$artifact*.AppImage" > /dev/null; then
