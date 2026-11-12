@@ -49,6 +49,15 @@ public:
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
         /// R16F at the render size: 1 where DLSS should use this frame's colour instead of history.
         std::optional<Image> bias_current_color;
+        /// The scene camera, for DLSS Frame Generation. Row-major matrices that take a column
+        /// vector, unjittered, with OpenGL clip depth (-1 to 1) and clip y up: the
+        /// view-projection and the motion vectors' clip-to-previous-clip. Without it the frame
+        /// gets no frame generation.
+        struct Camera {
+            std::array<f32, 16> view_projection;
+            std::array<f32, 16> clip_to_previous_clip;
+        };
+        std::optional<Camera> camera;
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.

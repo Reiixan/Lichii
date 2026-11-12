@@ -14,6 +14,7 @@ add_executable(tests
     video_core/frame_dump_schedule.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
+    video_core/list_macro_trace.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
@@ -21,10 +22,13 @@ add_executable(tests
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
+    core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
+    core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
+    core/key_derivation.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -84,6 +88,7 @@ add_executable(tests
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
+    video_core/frame_gen_choice.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -94,6 +99,7 @@ add_executable(tests
     video_core/oot_network.cpp
     video_core/page_filter.cpp
     video_core/pipeline_cache_policy.cpp
+    video_core/query_stream.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
@@ -166,6 +172,7 @@ add_executable(tests
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
+    common/memory_detect.cpp
     common/multi_level_page_table.cpp
     common/nextendo.cpp
     common/page_table.cpp
@@ -180,6 +187,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/local_redirect.cpp
     core/nextendo_redirect.cpp
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
@@ -205,6 +213,7 @@ add_executable(tests
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
+    video_core/ampere_gradient.cpp
     video_core/ampere_returns.cpp
     video_core/ampere_guarded_ulea.cpp
     video_core/ampere_compute_lowering.cpp
@@ -321,14 +330,16 @@ target_compile_definitions(shader_translation_tests PRIVATE
 add_test(NAME shader_translation_tests COMMAND shader_translation_tests)
 
 if (NOT ANDROID)
-    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)
+    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp
+                                 input_common/rumble_mapping.cpp)
     target_link_libraries(tests PRIVATE SDL3::SDL3)
 
     add_executable(config_tests
         common/first_run_config.cpp
         common/recommended_settings.cpp
         ../frontend_common/profile_import.cpp
-        ../frontend_common/config.cpp)
+        ../frontend_common/config.cpp
+        ../frontend_common/recommended_settings.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)

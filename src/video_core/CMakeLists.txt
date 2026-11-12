@@ -100,6 +100,7 @@ add_library(video_core STATIC
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    frame_gen_choice.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -120,6 +121,8 @@ add_library(video_core STATIC
     nx2.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
+    nx2_list_macro_trace.cpp
+    nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
@@ -645,6 +648,8 @@ if (ENABLE_NVIDIA_DLSS)
         vulkan_common/streamline.cpp
         vulkan_common/streamline.h
         vulkan_common/streamline_api.h
+        vulkan_common/streamline_frame_gen.cpp
+        vulkan_common/streamline_frame_gen.h
     )
     target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
     target_link_libraries(video_core PRIVATE version wintrust crypt32)

@@ -1046,10 +1046,24 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
+            std::vector<Sirit::Literal> literals;
+            std::vector<Id> labels;
             for (size_t index = 0; index < num_buffers; ++index) {
-                access(index, bases[index],
-                       OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
+                literals.push_back(static_cast<u32>(index));
+                labels.push_back(OpLabel());
             }
+            const Id default_label{OpLabel()};
+            OpSelectionMerge(default_label, spv::SelectionControlMask::MaskNone);
+            OpSwitch(best_index, default_label, literals, labels);
+            for (size_t index = 0; index < num_buffers; ++index) {
+                AddLabel(labels[index]);
+                const Id ssbo_id{ssbos[index].*ssbo_member};
+                const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, bases[index]))};
+                const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+                callback(OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index), ssbo_id,
+                         ssbo_index);
+            }
+            AddLabel(default_label);
             return;
         }
         for (size_t index = 0; index < num_buffers; ++index) {
