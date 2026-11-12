@@ -7,6 +7,7 @@
 #include <span>
 #include <vector>
 
+#include "common/cityhash.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "video_core/nx2_stutter_trace.h"
@@ -233,6 +234,14 @@ std::unique_ptr<PipelineBinaries> PipelineBinaries::Open(const Device& device,
     return binaries;
 }
 
+bool BlobDiagEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_BLOB_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 PipelineBinaries::PipelineBinaries(const Device& device_, std::filesystem::path file,
                                    const ShaderCacheV2::DeviceIdentity& identity)
     : device{device_}, store{std::move(file), identity, BlobOptions(device_)} {}
@@ -274,6 +283,10 @@ vk::Pipeline PipelineBinaries::Create(const CreateInfo& ci, VkPipelineCache cach
         !(driver_key = KeyBytes(pipeline_key))) {
         return CreateNormally(logical, ci, cache);
     }
+    const bool diag = BlobDiagEnabled();
+    const auto key_hash = [](const std::vector<u8>& bytes) {
+        return Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
     if (const auto payload = store.Find(kind, key)) {
         const auto stored = ShaderCacheV2::DecodeBinaries(*payload);
         if (stored && stored->pipeline_key == *driver_key) {
@@ -282,6 +295,14 @@ vk::Pipeline PipelineBinaries::Create(const CreateInfo& ci, VkPipelineCache cach
                 StutterTrace::CountDriverBuild(StutterTrace::DriverBuild::Binary);
                 return vk::Pipeline(pipeline, handle, dld);
             }
+        }
+        if (diag) {
+            LOG_INFO(Render_Vulkan, "Blob diag reject {} {:016x}: driver key {:016x}, stored {} {}",
+                     kind == RecordKind::GraphicsBinary ? "graphics" : "compute", key,
+                     key_hash(*driver_key),
+                     stored ? fmt::format("{:016x}", key_hash(stored->pipeline_key))
+                            : std::string{"undecodable"},
+                     t_blob_diag);
         }
         // Stale (new SPIR-V for this key) or refused: compiled below, and replaced
         store.Reject(kind, key);
@@ -311,6 +332,11 @@ vk::Pipeline PipelineBinaries::Create(const CreateInfo& ci, VkPipelineCache cach
     }
     StutterTrace::CountDriverBuild(StutterTrace::DriverBuild::Compiled);
     if (auto captured = Capture(dld, handle, pipeline)) {
+        if (diag) {
+            LOG_INFO(Render_Vulkan, "Blob diag write {} {:016x}: driver key {:016x} {}",
+                     kind == RecordKind::GraphicsBinary ? "graphics" : "compute", key,
+                     key_hash(*driver_key), t_blob_diag);
+        }
         captured->pipeline_key = std::move(*driver_key);
         store.Store(kind, key, ShaderCacheV2::EncodeBinaries(*captured));
     }

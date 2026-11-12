@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
 
 #include "common/common_types.h"
@@ -14,6 +15,11 @@
 namespace Vulkan {
 
 class Device;
+
+/// EDEN_NX2_BLOB_DIAG=1: what the pipeline being built on this thread is made of (its SPIR-V
+/// hashes), logged with each blob written or rejected, to compare sessions.
+[[nodiscard]] bool BlobDiagEnabled();
+inline thread_local std::string t_blob_diag;
 
 /// Shader cache v2's driver layer on VK_KHR_pipeline_binary, which only v2 enables, and only on
 /// drivers that don't prefer their own cache (Device). A pipeline is built from the binaries stored

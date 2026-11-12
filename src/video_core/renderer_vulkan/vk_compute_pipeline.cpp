@@ -309,6 +309,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
+            t_blob_diag.clear();
             pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
                                                                   binary_key)
                                 : device.GetLogical().CreateComputePipeline(compute_ci,

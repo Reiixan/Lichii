@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/cityhash.h"
 #include "common/scope_exit.h"
 #include "common/zstd_compression.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
@@ -622,6 +623,18 @@ GraphicsPipeline::GraphicsPipeline(
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
+            if (BlobDiagEnabled()) {
+                t_blob_diag.clear();
+                for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                    if (!spirv[stage].empty()) {
+                        t_blob_diag += fmt::format(
+                            " s{}={:016x}/{}", stage,
+                            Common::CityHash64(reinterpret_cast<const char*>(spirv[stage].data()),
+                                               spirv[stage].size() * sizeof(u32)),
+                            spirv[stage].size());
+                    }
+                }
+            }
             MakePipeline(render_pass);
         } catch (const Shader::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
