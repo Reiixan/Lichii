@@ -8,6 +8,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <span>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
@@ -557,6 +561,51 @@ bool BufferCacheRuntime::IsFreeNow(u64 tick) {
     return scheduler.IsFree(tick);
 }
 
+namespace {
+// EDEN_NX2_GPU_PROFILE: copies that end a render pass, by the CopyBuffer caller line and the
+// SynchronizeBuffer call site (0: not inside one), with their bytes.
+struct InPassCopyStats {
+    u64 count = 0;
+    u64 bytes = 0;
+    u64 small = 0; // 256 bytes or less
+};
+std::mutex g_in_pass_mutex;
+std::map<std::tuple<u32, u32, bool, bool>, InPassCopyStats> g_in_pass_copies;
+u64 g_in_pass_window = 0;
+
+void NoteInPassCopy(u32 caller_line, u32 sync_line, u64 bytes, bool stream, bool reorder) {
+    const u64 now = VideoCommon::Nx2Profile::Now();
+    std::scoped_lock lock{g_in_pass_mutex};
+    auto& stats = g_in_pass_copies[{caller_line, sync_line, stream, reorder}];
+    ++stats.count;
+    stats.bytes += bytes;
+    stats.small += bytes <= 256 ? 1 : 0;
+    if (g_in_pass_window == 0) {
+        g_in_pass_window = now;
+        return;
+    }
+    if (now - g_in_pass_window < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - g_in_pass_window) / 1e9;
+    g_in_pass_window = now;
+    std::vector<std::pair<u64, std::string>> lines;
+    for (const auto& [key, s] : g_in_pass_copies) {
+        const auto& [caller, sync, from_stream, could_reorder] = key;
+        lines.emplace_back(s.count, fmt::format("{:.0f}/s, {:.0f} bytes each, {:.0f}% of 256 bytes or less: CopyBuffer from buffer_cache.h:{} via SynchronizeBuffer at line {} (stream {}, reorder {})",
+                                                static_cast<double>(s.count) / seconds,
+                                                static_cast<double>(s.bytes) / static_cast<double>(s.count),
+                                                100.0 * static_cast<double>(s.small) / static_cast<double>(s.count),
+                                                caller, sync, from_stream, could_reorder));
+    }
+    g_in_pass_copies.clear();
+    std::sort(lines.rbegin(), lines.rend());
+    for (size_t i = 0; i < lines.size() && i < 10; ++i) {
+        LOG_INFO(Render_Vulkan, "Buffer copies inside a render pass: {}", lines[i].second);
+    }
+}
+} // Anonymous namespace
+
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
@@ -571,7 +620,7 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, std::source_location location) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -599,7 +648,15 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
 
-    scheduler.RequestOutsideRenderPassOperationContext();
+    if (VideoCommon::Nx2Profile::Enabled() && scheduler.IsRenderPassActive()) {
+        u64 bytes = 0;
+        for (const VkBufferCopy& copy : vk_copies) {
+            bytes += copy.size;
+        }
+        NoteInPassCopy(location.line(), VideoCommon::g_profile_sync_line, bytes,
+                       src_buffer == staging_pool.StreamBuf(), can_reorder_upload);
+    }
+    scheduler.RequestOutsideRenderPassOperationContext(location);
     if (barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
         // Only in-order stream uploads share barriers. Dedicated staging buffers retain their
         // normal recording path and tick-based reuse.

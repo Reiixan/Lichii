@@ -57,6 +57,9 @@
 
 namespace VideoCommon {
 
+/// EDEN_NX2_GPU_PROFILE: the SynchronizeBuffer call site whose upload is being recorded (0 outside).
+inline thread_local u32 g_profile_sync_line = 0;
+
 using BufferId = Common::SlotId;
 
 using VideoCore::Surface::PixelFormat;
@@ -723,7 +726,8 @@ private:
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size,
+                           std::source_location location = std::source_location::current());
 
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);

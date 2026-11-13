@@ -1165,9 +1165,14 @@ void Scheduler::EndPendingOperations() {
 
 void Scheduler::EndRenderPass()
     {
+        const bool clear_was_deferred = deferred_clear.framebuffer != nullptr;
         RealizeDeferredClear();
         if (!state.renderpass) {
             return;
+        }
+        if (VideoCommon::Nx2Profile::Enabled() && clear_was_deferred && t_pending_end_site.empty()) {
+            // The deferred clear began a pass only for this end to close it again.
+            t_pending_end_site = "clear-only pass ended at once (deferred clear realized by an end)";
         }
         if (VideoCommon::Nx2Profile::Enabled()) {
             t_ended_framebuffer = state.framebuffer;

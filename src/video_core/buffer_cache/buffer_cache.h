@@ -3854,7 +3854,13 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 }
 
 template <class P>
-bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size,
+                                       std::source_location location) {
+    const u32 previous_sync_line = g_profile_sync_line;
+    g_profile_sync_line = location.line();
+    SCOPE_EXIT {
+        g_profile_sync_line = previous_sync_line;
+    };
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = !Nx2Perf::Verify();
