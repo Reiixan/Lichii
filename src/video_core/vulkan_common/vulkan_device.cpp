@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include "common/container/unordered_map.h"
@@ -433,20 +434,138 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
 PFN_vkAllocateMemory g_vma_allocate_memory{};
 PFN_vkFreeMemory g_vma_free_memory{};
 
+// EDEN_NX2_STUTTER_TRACE also tells VMA's device memory calls apart: block (VMA's own blocks),
+// dedicated_image / dedicated_buffer (an allocation with memory of its own: over half a block, or
+// the driver asked for it) and free. Every second with calls gets an Nx2Alloc line with each
+// kind's count, size and time; a call of at least SlowAllocateMs gets an Nx2AllocSlow line with
+// its heap's usage and budget at the time.
+enum class AllocKind : size_t { Block, DedicatedImage, DedicatedBuffer, Free, Count };
+constexpr std::array<std::string_view, static_cast<size_t>(AllocKind::Count)> alloc_kind_names{
+    "block", "dedicated_image", "dedicated_buffer", "free"};
+constexpr double SlowAllocateMs = 2.0;
+constexpr u32 MaxSlowAllocateLogs = 4000;
+
+struct AllocStats {
+    u64 count{};
+    u64 bytes{};
+    double ms{};
+    double max_ms{};
+};
+
+const vk::PhysicalDevice* g_alloc_physical{};
+bool g_alloc_budget{};
+std::array<u32, VK_MAX_MEMORY_TYPES> g_type_heap{};
+std::array<bool, VK_MAX_MEMORY_TYPES> g_type_device_local{};
+std::mutex g_alloc_mutex;
+std::array<AllocStats, static_cast<size_t>(AllocKind::Count)> g_alloc_window{};
+std::chrono::steady_clock::time_point g_alloc_window_start{};
+u32 g_slow_allocate_logs{};
+
+AllocKind KindOf(const VkMemoryAllocateInfo& info) {
+    for (auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next != nullptr;
+         next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+            const auto& dedicated = *reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next);
+            return dedicated.image != VK_NULL_HANDLE ? AllocKind::DedicatedImage
+                                                     : AllocKind::DedicatedBuffer;
+        }
+    }
+    return AllocKind::Block;
+}
+
+// Under g_alloc_mutex. The line is written at the first call after the window: start_ago_s says
+// how long before the line's time the window began.
+void FlushAllocWindow(std::chrono::steady_clock::time_point now) {
+    std::string kinds;
+    for (size_t kind = 0; kind < g_alloc_window.size(); ++kind) {
+        const AllocStats& stats = g_alloc_window[kind];
+        if (stats.count != 0) {
+            kinds += fmt::format(" {}={}x{:.0f}MiB/{:.1f}ms(max {:.1f})", alloc_kind_names[kind],
+                                 stats.count, static_cast<double>(stats.bytes) / 1048576.0,
+                                 stats.ms, stats.max_ms);
+        }
+    }
+    if (!kinds.empty()) {
+        LOG_INFO(Render_Vulkan, "Nx2Alloc start_ago_s={:.2f}{}",
+                 std::chrono::duration<double>(now - g_alloc_window_start).count(), kinds);
+    }
+    g_alloc_window = {};
+    g_alloc_window_start = now;
+}
+
+void NoteAllocCall(AllocKind kind, u64 bytes, double ms, u32 type, VkResult result) {
+    const auto now = std::chrono::steady_clock::now();
+    bool log_slow = false;
+    {
+        std::scoped_lock lock{g_alloc_mutex};
+        if (g_alloc_window_start == std::chrono::steady_clock::time_point{}) {
+            g_alloc_window_start = now;
+        } else if (now - g_alloc_window_start >= std::chrono::seconds{1}) {
+            FlushAllocWindow(now);
+        }
+        AllocStats& stats = g_alloc_window[static_cast<size_t>(kind)];
+        ++stats.count;
+        stats.bytes += bytes;
+        stats.ms += ms;
+        stats.max_ms = (std::max)(stats.max_ms, ms);
+        if (ms >= SlowAllocateMs && g_slow_allocate_logs < MaxSlowAllocateLogs) {
+            ++g_slow_allocate_logs;
+            log_slow = true;
+        }
+    }
+    if (!log_slow) {
+        return;
+    }
+    std::string heap_text;
+    if (kind != AllocKind::Free && type < VK_MAX_MEMORY_TYPES) {
+        const u32 heap = g_type_heap[type];
+        heap_text = fmt::format(" type={} heap={} device_local={}", type, heap,
+                                g_type_device_local[type]);
+        if (g_alloc_budget && g_alloc_physical != nullptr) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+            budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+            g_alloc_physical->GetMemoryProperties(&budget);
+            heap_text += fmt::format(" heap_usage_mib={} heap_budget_mib={}",
+                                     budget.heapUsage[heap] >> 20, budget.heapBudget[heap] >> 20);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Nx2AllocSlow kind={} size_kib={} ms={:.1f} result={}{}",
+             alloc_kind_names[static_cast<size_t>(kind)], bytes >> 10, ms,
+             static_cast<int>(result), heap_text);
+}
+
+double MsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+        .count();
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
                                                    const VkMemoryAllocateInfo* allocate_info,
                                                    const VkAllocationCallbacks* allocator,
                                                    VkDeviceMemory* memory) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryAllocate};
-    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    if (!Enabled()) {
+        return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const VkResult result = g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    NoteAllocCall(KindOf(*allocate_info), allocate_info->allocationSize, MsSince(start),
+                  allocate_info->memoryTypeIndex, result);
+    return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
                                            const VkAllocationCallbacks* allocator) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryFree};
+    if (!Enabled()) {
+        g_vma_free_memory(device, memory, allocator);
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
     g_vma_free_memory(device, memory, allocator);
+    NoteAllocCall(AllocKind::Free, 0, MsSince(start), 0, VK_SUCCESS);
 }
 
 } // Anonymous namespace
@@ -933,6 +1052,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     g_vma_free_memory = dld.vkFreeMemory;
     functions.vkAllocateMemory = TimedAllocateMemory;
     functions.vkFreeMemory = TimedFreeMemory;
+    g_alloc_physical = &physical;
+    g_alloc_budget = extensions.memory_budget;
+    {
+        const auto types = physical.GetMemoryProperties().memoryProperties;
+        for (u32 type = 0; type < types.memoryTypeCount; ++type) {
+            g_type_heap[type] = types.memoryTypes[type].heapIndex;
+            g_type_device_local[type] =
+                (types.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        }
+    }
 
     // Synchronized inside VMA: the image recycler destroys dropped images on a thread of its own
     // while the GPU thread allocates (vulkan_wrapper.cpp).
