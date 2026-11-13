@@ -567,7 +567,7 @@ namespace {
 struct InPassCopyStats {
     u64 count = 0;
     u64 bytes = 0;
-    u64 small = 0; // 256 bytes or less
+    u64 tiny = 0; // 256 bytes or less
 };
 std::mutex g_in_pass_mutex;
 std::map<std::tuple<u32, u32, bool, bool>, InPassCopyStats> g_in_pass_copies;
@@ -579,7 +579,7 @@ void NoteInPassCopy(u32 caller_line, u32 sync_line, u64 bytes, bool stream, bool
     auto& stats = g_in_pass_copies[{caller_line, sync_line, stream, reorder}];
     ++stats.count;
     stats.bytes += bytes;
-    stats.small += bytes <= 256 ? 1 : 0;
+    stats.tiny += bytes <= 256 ? 1 : 0;
     if (g_in_pass_window == 0) {
         g_in_pass_window = now;
         return;
@@ -595,7 +595,7 @@ void NoteInPassCopy(u32 caller_line, u32 sync_line, u64 bytes, bool stream, bool
         lines.emplace_back(s.count, fmt::format("{:.0f}/s, {:.0f} bytes each, {:.0f}% of 256 bytes or less: CopyBuffer from buffer_cache.h:{} via SynchronizeBuffer at line {} (stream {}, reorder {})",
                                                 static_cast<double>(s.count) / seconds,
                                                 static_cast<double>(s.bytes) / static_cast<double>(s.count),
-                                                100.0 * static_cast<double>(s.small) / static_cast<double>(s.count),
+                                                100.0 * static_cast<double>(s.tiny) / static_cast<double>(s.count),
                                                 caller, sync, from_stream, could_reorder));
     }
     g_in_pass_copies.clear();
