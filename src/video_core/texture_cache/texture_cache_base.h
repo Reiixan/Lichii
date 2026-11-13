@@ -11,6 +11,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <source_location>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -602,7 +603,8 @@ private:
     void UntrackImage(ImageBase& image, ImageId image_id);
 
     /// Delete image from the cache
-    void DeleteImage(ImageId image, bool immediate_delete = false);
+    void DeleteImage(ImageId image, bool immediate_delete = false,
+                     std::source_location location = std::source_location::current());
 
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
@@ -673,6 +675,26 @@ private:
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
     Churn churn;
+    /// EDEN_NX2_GPU_PROFILE: ASTC images (decoded on the GPU where the host lacks ASTC) created,
+    /// created again at the address and shape of one deleted before, deleted (young: within
+    /// 120 frames of their creation, by DeleteImage caller line) and uploaded again.
+    struct AstcChurn {
+        u64 created{};
+        u64 recreated{};
+        u64 recreated_young{};
+        u64 joined{};
+        u64 deleted{};
+        u64 deleted_young{};
+        u64 first_uploads{};
+        u64 reuploads{};
+        u64 window_frame{};
+        std::chrono::steady_clock::time_point window_start{};
+        std::unordered_map<u64, u64> deleted_at;
+        std::map<u32, u64> delete_sites;
+    };
+    AstcChurn astc_churn;
+    static u64 AstcChurnKey(const ImageBase& image) noexcept;
+    void ReportAstcChurn();
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

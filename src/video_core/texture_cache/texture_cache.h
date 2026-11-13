@@ -599,7 +599,64 @@ void TextureCache<P>::EvictDeadRenderTargets() {
 }
 
 template <class P>
+u64 TextureCache<P>::AstcChurnKey(const ImageBase& image) noexcept {
+    u64 key = image.cpu_addr;
+    key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(image.info.format);
+    key = key * 0x9E3779B97F4A7C15ULL ^
+          (u64{image.info.size.width} << 32 | image.info.size.height);
+    key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(image.info.resources.levels);
+    return key;
+}
+
+template <class P>
+void TextureCache<P>::ReportAstcChurn() {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (astc_churn.window_start == std::chrono::steady_clock::time_point{}) {
+        astc_churn.window_start = now;
+        astc_churn.window_frame = frame_tick;
+        return;
+    }
+    if (now - astc_churn.window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - astc_churn.window_start).count();
+    const double frames = static_cast<double>(frame_tick - astc_churn.window_frame);
+    std::string sites;
+    for (const auto& [line, count] : astc_churn.delete_sites) {
+        sites += fmt::format(" {}:{:.0f}/s", line, static_cast<double>(count) / seconds);
+    }
+    LOG_INFO(HW_GPU,
+             "ASTC images per second: {:.0f} created ({:.0f} from overlaps), {:.0f} made again at "
+             "the address and shape of a deleted image ({:.0f} within 120 frames), {:.0f} deleted "
+             "({:.0f} within 120 frames of creation), {:.0f} first uploads, {:.0f} uploads again; "
+             "{:.1f} frames per second; deleted by line:{}",
+             static_cast<double>(astc_churn.created) / seconds,
+             static_cast<double>(astc_churn.joined) / seconds,
+             static_cast<double>(astc_churn.recreated) / seconds,
+             static_cast<double>(astc_churn.recreated_young) / seconds,
+             static_cast<double>(astc_churn.deleted) / seconds,
+             static_cast<double>(astc_churn.deleted_young) / seconds,
+             static_cast<double>(astc_churn.first_uploads) / seconds,
+             static_cast<double>(astc_churn.reuploads) / seconds, frames / seconds, sites);
+    astc_churn.created = 0;
+    astc_churn.recreated = 0;
+    astc_churn.recreated_young = 0;
+    astc_churn.joined = 0;
+    astc_churn.deleted = 0;
+    astc_churn.deleted_young = 0;
+    astc_churn.first_uploads = 0;
+    astc_churn.reuploads = 0;
+    astc_churn.delete_sites.clear();
+    astc_churn.window_start = now;
+    astc_churn.window_frame = frame_tick;
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
+    ReportAstcChurn();
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -2516,6 +2573,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    if (VideoCommon::Nx2Profile::Enabled() &&
+        VideoCore::Surface::IsPixelFormatASTC(image.info.format)) {
+        ++(image.profile_uploads++ == 0 ? astc_churn.first_uploads : astc_churn.reuploads);
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -3549,6 +3610,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ++images_created;
         ++churn.created;
         churn.joins += join_overlap_ids.empty() ? 0 : 1;
+        if (VideoCommon::Nx2Profile::Enabled() &&
+            VideoCore::Surface::IsPixelFormatASTC(new_image.info.format)) {
+            ++astc_churn.created;
+            astc_churn.joined += join_overlap_ids.empty() ? 0 : 1;
+            if (const auto it = astc_churn.deleted_at.find(AstcChurnKey(new_image));
+                it != astc_churn.deleted_at.end()) {
+                ++astc_churn.recreated;
+                astc_churn.recreated_young += frame_tick - it->second <= 120 ? 1 : 0;
+                astc_churn.deleted_at.erase(it);
+            }
+        }
     }
 
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
@@ -4451,11 +4523,24 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 }
 
 template <class P>
-void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete,
+                                  std::source_location location) {
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     ++churn.deleted;
+    if (VideoCommon::Nx2Profile::Enabled() &&
+        VideoCore::Surface::IsPixelFormatASTC(image.info.format)) {
+        ++astc_churn.deleted;
+        ++astc_churn.delete_sites[location.line()];
+        if (frame_tick - slot_images[image_id].allocation_tick <= 120) {
+            ++astc_churn.deleted_young;
+        }
+        if (astc_churn.deleted_at.size() > 200000) {
+            astc_churn.deleted_at.clear();
+        }
+        astc_churn.deleted_at[AstcChurnKey(image)] = frame_tick;
+    }
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left

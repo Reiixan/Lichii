@@ -136,6 +136,7 @@ struct ImageBase {
 
     /// Set through SetModificationTick.
     u64 modification_tick = 0;
+    u32 profile_uploads = 0; ///< EDEN_NX2_GPU_PROFILE: RefreshContents uploads (AstcChurn)
     /// At least the newest modification_tick among aliased_images (raised when an alias's tick is
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
