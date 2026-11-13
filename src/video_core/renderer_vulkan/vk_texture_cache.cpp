@@ -291,6 +291,15 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
 // arrays.
 [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
+    // EDEN_NX2_UNEVEN_RGBA8=0: keep them as BC (the AMD sampling artifacts come back), to measure
+    // what the RGBA8 copies cost in device memory (a 1365x1365x90 array: ~890 MiB vs ~225 MiB).
+    static const bool rgba8_enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_UNEVEN_RGBA8");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!rgba8_enabled) {
+        return false;
+    }
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||

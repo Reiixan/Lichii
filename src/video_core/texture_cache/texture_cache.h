@@ -632,7 +632,8 @@ void TextureCache<P>::ReportAstcChurn() {
              "ASTC images per second: {:.0f} created ({:.0f} from overlaps), {:.0f} made again at "
              "the address and shape of a deleted image ({:.0f} within 120 frames), {:.0f} deleted "
              "({:.0f} within 120 frames of creation), {:.0f} first uploads, {:.0f} uploads again; "
-             "{:.1f} frames per second; deleted by line:{}",
+             "{:.1f} frames per second; cache {} MiB, budget limit {} MiB, expected {} MiB, "
+             "critical {} MiB; deleted by line:{}",
              static_cast<double>(astc_churn.created) / seconds,
              static_cast<double>(astc_churn.joined) / seconds,
              static_cast<double>(astc_churn.recreated) / seconds,
@@ -640,7 +641,9 @@ void TextureCache<P>::ReportAstcChurn() {
              static_cast<double>(astc_churn.deleted) / seconds,
              static_cast<double>(astc_churn.deleted_young) / seconds,
              static_cast<double>(astc_churn.first_uploads) / seconds,
-             static_cast<double>(astc_churn.reuploads) / seconds, frames / seconds, sites);
+             static_cast<double>(astc_churn.reuploads) / seconds, frames / seconds,
+             total_used_memory >> 20, retention_limit >> 20, expected_memory >> 20,
+             critical_memory >> 20, sites);
     astc_churn.created = 0;
     astc_churn.recreated = 0;
     astc_churn.recreated_young = 0;
