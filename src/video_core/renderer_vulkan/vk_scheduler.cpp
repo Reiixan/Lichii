@@ -46,6 +46,14 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+// Restarts: a pass that begins on the framebuffer the previous pass ended on (the end only
+// split it, so its attachments are stored and loaded again), by the site that ended it.
+std::map<std::string, u64> g_profile_restarts;
+std::atomic<u64> g_profile_restart_pixels{};
+thread_local std::string t_pending_end_site;
+thread_local VkFramebuffer t_ended_framebuffer{};
+thread_local VkExtent2D t_ended_area{};
+thread_local std::string t_ended_site;
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -56,7 +64,8 @@ void CountRenderPassEnd(const char* file, u32 line) {
         name.remove_prefix(slash + 1);
     }
     std::scoped_lock lock{g_profile_end_mutex};
-    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+    t_pending_end_site = fmt::format("{}:{}", name, line);
+    ++g_profile_ends[t_pending_end_site];
 }
 
 void ReportSubmitCounts() {
@@ -91,6 +100,24 @@ void ReportSubmitCounts() {
     for (size_t i = 0; i < ends.size() && i < 16; ++i) {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+    std::vector<std::pair<u64, std::string>> restarts;
+    u64 restart_total = 0;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, count] : g_profile_restarts) {
+            restarts.emplace_back(count, site);
+            restart_total += count;
+        }
+        g_profile_restarts.clear();
+    }
+    std::sort(restarts.rbegin(), restarts.rend());
+    LOG_INFO(Render_Vulkan, "Render pass restarts on the same framebuffer {:.0f}/s ({:.0f} Mpixel/s reloaded)",
+             static_cast<double>(restart_total) / seconds,
+             static_cast<double>(g_profile_restart_pixels.exchange(0)) / 1e6 / seconds);
+    for (size_t i = 0; i < restarts.size() && i < 12; ++i) {
+        LOG_INFO(Render_Vulkan, "Render pass restarts {:.0f}/s after an end at {}",
+                 static_cast<double>(restarts[i].first) / seconds, restarts[i].second);
     }
 }
 }
@@ -377,6 +404,15 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+        const VkExtent2D area = framebuffer->RenderArea();
+        if (framebuffer->Handle() == t_ended_framebuffer &&
+            area.width == t_ended_area.width && area.height == t_ended_area.height) {
+            g_profile_restart_pixels.fetch_add(u64{area.width} * area.height,
+                                               std::memory_order_relaxed);
+            std::scoped_lock lock{g_profile_end_mutex};
+            ++g_profile_restarts[t_ended_site];
+        }
+        t_ended_framebuffer = VkFramebuffer{};
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -1132,6 +1168,13 @@ void Scheduler::EndRenderPass()
         RealizeDeferredClear();
         if (!state.renderpass) {
             return;
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            t_ended_framebuffer = state.framebuffer;
+            t_ended_area = state.render_area;
+            t_ended_site = t_pending_end_site.empty() ? std::string{"(submit or other)"}
+                                                      : t_pending_end_site;
+            t_pending_end_site.clear();
         }
         ++recording_epoch;
         fragment_barrier.Reset();
