@@ -5708,7 +5708,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                     output.offset, total,
                                     copies[level].buffer_offset + layer_bytes[level] * base,
                                     (std::max)(width >> level, 1U),
-                                    (std::max)(height >> level, 1U));
+                                    (std::max)(height >> level, 1U),
+                                    IsPixelFormatSRGB(info.format));
         }
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
