@@ -60,6 +60,12 @@ public:
     void ClearCache();
     /// Calculates how much space is remaining to use.
     size_t SpaceRemaining() const;
+    /// With far code: the space left in the near region and in the far (cold) region, each on its
+    /// own (SpaceRemaining is the smaller one). Without it, both are SpaceRemaining.
+    size_t NearSpaceRemaining() const;
+    size_t FarSpaceRemaining() const;
+    /// Bytes emitted into the far (cold) region; 0 without one.
+    size_t FarCodeUsed() const;
     /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
     void EnsureMemoryCommitted(size_t codesize);
 

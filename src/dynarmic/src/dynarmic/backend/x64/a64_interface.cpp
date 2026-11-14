@@ -292,16 +292,23 @@ public:
         if (emitter.GetBasicBlock(descriptor)) {
             return PrecompileResult::Present;
         }
-        // Never the cache eviction GetBlock does when it runs out of space.
-        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE + keep_free) {
+        // Never the cache eviction GetBlock does when it runs out of space. keep_free is for the
+        // whole cache: with far code, the far (cold) region keeps a quarter of it (the region is
+        // a quarter of the cache). Checked against the smaller of the two regions, keep_free
+        // (128 MiB) was never left in a 128 MiB far region and nothing was warmed up.
+        const size_t far_keep_free = block_of_code.HasFarCode() ? keep_free / 4 : keep_free;
+        if (block_of_code.NearSpaceRemaining() < MINIMUM_REMAINING_CODESIZE + keep_free ||
+            block_of_code.FarSpaceRemaining() < MINIMUM_REMAINING_CODESIZE + far_keep_free) {
             return PrecompileResult::Full;
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
         return CompileBlock(descriptor, true) ? PrecompileResult::Compiled : PrecompileResult::Unreadable;
     }
 
+    /// Near and far (cold) code together.
     size_t CodeCacheUsed() const {
-        return size_t(reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin()));
+        return size_t(reinterpret_cast<const char*>(block_of_code.getCurr()) - reinterpret_cast<const char*>(block_of_code.GetCodeBegin())) +
+               block_of_code.FarCodeUsed();
     }
 private:
 

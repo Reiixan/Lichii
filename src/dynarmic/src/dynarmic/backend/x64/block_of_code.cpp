@@ -251,17 +251,32 @@ void BlockOfCode::SwitchToNearCode() {
 }
 
 size_t BlockOfCode::SpaceRemaining() const {
+    return (std::min)(NearSpaceRemaining(), FarSpaceRemaining());
+}
+
+size_t BlockOfCode::NearSpaceRemaining() const {
     ASSERT(prelude_complete);
     const u8* current_ptr = in_far_code ? near_code_ptr : getCurr<const u8*>();
     const u8* const near_end = far_code_begin ? far_code_begin : &top_[maxSize_];
     if (current_ptr >= near_end)
         return 0;
-    size_t remaining = near_end - current_ptr;
-    if (far_code_begin) {
-        const u8* const far_ptr = in_far_code ? getCurr<const u8*>() : far_code_ptr;
-        remaining = far_ptr >= &top_[maxSize_] ? 0 : (std::min<size_t>)(remaining, &top_[maxSize_] - far_ptr);
+    return near_end - current_ptr;
+}
+
+size_t BlockOfCode::FarSpaceRemaining() const {
+    if (!far_code_begin) {
+        return NearSpaceRemaining();
     }
-    return remaining;
+    const u8* const far_ptr = in_far_code ? getCurr<const u8*>() : far_code_ptr;
+    return far_ptr >= &top_[maxSize_] ? 0 : size_t(&top_[maxSize_] - far_ptr);
+}
+
+size_t BlockOfCode::FarCodeUsed() const {
+    if (!far_code_begin) {
+        return 0;
+    }
+    const u8* const far_ptr = in_far_code ? getCurr<const u8*>() : far_code_ptr;
+    return size_t(far_ptr - far_code_begin);
 }
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {

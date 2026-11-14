@@ -328,8 +328,9 @@ bool JitWarmup::Run(size_t core, Dynarmic::A64::Jit& jit, const std::atomic<bool
             if (result == Dynarmic::A64::PrecompileResult::Full) {
                 work.full = true;
                 LOG_WARNING(Core_ARM,
-                            "JIT warm-up: core {} stops, less than {} MiB of code cache left",
-                            core, keep_free >> 20);
+                            "JIT warm-up: core {} stops at {} MiB of code: less than {} MiB "
+                            "left in the code cache (a quarter of that in its cold region)",
+                            core, jit.CodeCacheUsed() >> 20, keep_free >> 20);
                 break;
             }
             ++work.cursor;
