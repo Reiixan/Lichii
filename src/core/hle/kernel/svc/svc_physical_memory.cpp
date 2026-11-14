@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 
 #include "core/core.h"
@@ -12,6 +13,28 @@
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
+
+namespace {
+// EDEN_NX2_STUTTER_TRACE: physical memory (un)maps of 2 ms or more, with their size. Ocarina's
+// zone changes spent a third of a guest core's slow frames under these (host view mapping).
+void NoteSlowPhysicalMemory(const char* name, u64 addr, u64 size,
+                            std::chrono::steady_clock::time_point start) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_STUTTER_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+    if (ms >= 2.0) {
+        LOG_INFO(Kernel_SVC, "Nx2PhysMem {} addr={:#x} size_kib={} ms={:.1f}", name, addr,
+                 size >> 10, ms);
+    }
+}
+} // namespace
 
 /// Set the process heap to a given Size. It can both extend and shrink the heap.
 Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
@@ -81,7 +104,10 @@ Result MapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
         R_THROW(ResultInvalidMemoryRegion);
     }
 
-    R_RETURN(page_table.MapPhysicalMemory(addr, size));
+    const auto start = std::chrono::steady_clock::now();
+    const Result result = page_table.MapPhysicalMemory(addr, size);
+    NoteSlowPhysicalMemory("MapPhysicalMemory", addr, size, start);
+    R_RETURN(result);
 }
 
 /// Unmaps memory previously mapped via MapPhysicalMemory
@@ -130,7 +156,10 @@ Result UnmapPhysicalMemory(Core::System& system, u64 addr, u64 size) {
         R_THROW(ResultInvalidMemoryRegion);
     }
 
-    R_RETURN(page_table.UnmapPhysicalMemory(addr, size));
+    const auto start = std::chrono::steady_clock::now();
+    const Result result = page_table.UnmapPhysicalMemory(addr, size);
+    NoteSlowPhysicalMemory("UnmapPhysicalMemory", addr, size, start);
+    R_RETURN(result);
 }
 
 Result MapPhysicalMemoryUnsafe(Core::System& system, uint64_t address, uint64_t size) {

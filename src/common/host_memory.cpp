@@ -5,6 +5,10 @@
 
 #ifdef _WIN32
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
@@ -269,23 +273,98 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
+        const auto start = std::chrono::steady_clock::now();
         HandedOut(host_offset, length);
-        std::unique_lock lock{placeholder_mutex};
-        if (!IsNiechePlaceholder(virtual_offset, length)) {
-            Split(virtual_offset, length);
-        }
-        ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) == placeholders.end());
-        TrackPlaceholder(virtual_offset, host_offset, length);
+        {
+            std::unique_lock lock{placeholder_mutex};
+            if (!IsNiechePlaceholder(virtual_offset, length)) {
+                Split(virtual_offset, length);
+            }
+            ASSERT(placeholders.find({virtual_offset, virtual_offset + length}) ==
+                   placeholders.end());
+            TrackPlaceholder(virtual_offset, host_offset, length);
 
-        MapView(virtual_offset, host_offset, length);
+            MapView(virtual_offset, host_offset, length);
+        }
+        NoteMapStats(map_stats, start, length, 1);
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
-        std::scoped_lock lock{placeholder_mutex};
+        const auto start = std::chrono::steady_clock::now();
+        u64 views = 0;
+        {
+            std::scoped_lock lock{placeholder_mutex};
 
-        // Unmap until there are no more placeholders
-        while (UnmapOnePlaceholder(virtual_offset, length)) {
+            // Unmap until there are no more placeholders
+            while (UnmapOnePlaceholder(virtual_offset, length)) {
+                ++views;
+            }
         }
+        NoteMapStats(unmap_stats, start, length, views);
+    }
+
+    // EDEN_NX2_STUTTER_TRACE: host views mapped and unmapped for guest memory, every ~5 s with
+    // activity. In Ocarina's zone changes a third of a guest core's time in slow frames went to
+    // MapViewOfFile3/UnmapViewOfFile2 under svcMapPhysicalMemory/svcUnmapPhysicalMemory.
+    struct MapStats {
+        std::atomic<u64> calls{};
+        std::atomic<u64> views{};
+        std::atomic<u64> bytes{};
+        std::atomic<u64> small_calls{}; ///< calls of 64 KiB or less
+        std::atomic<u64> ns{};
+        std::atomic<u64> max_ns{};
+    };
+    MapStats map_stats;
+    MapStats unmap_stats;
+    std::atomic<long long> map_stats_report_ns{};
+
+    void NoteMapStats(MapStats& stats, std::chrono::steady_clock::time_point start, size_t length,
+                      u64 views) {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_STUTTER_TRACE");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (!enabled) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const u64 ns = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        stats.views.fetch_add(views, std::memory_order_relaxed);
+        stats.bytes.fetch_add(length, std::memory_order_relaxed);
+        if (length <= 64 * 1024) {
+            stats.small_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        stats.ns.fetch_add(ns, std::memory_order_relaxed);
+        u64 max = stats.max_ns.load(std::memory_order_relaxed);
+        while (ns > max && !stats.max_ns.compare_exchange_weak(max, ns)) {
+        }
+        const long long now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        long long last = map_stats_report_ns.load(std::memory_order_relaxed);
+        if (last == 0) {
+            map_stats_report_ns.compare_exchange_strong(last, now_ns);
+            return;
+        }
+        if (now_ns - last < 5'000'000'000LL ||
+            !map_stats_report_ns.compare_exchange_strong(last, now_ns)) {
+            return;
+        }
+        const auto take = [](MapStats& s) {
+            return std::array<u64, 6>{s.calls.exchange(0), s.views.exchange(0),
+                                      s.bytes.exchange(0), s.small_calls.exchange(0),
+                                      s.ns.exchange(0),    s.max_ns.exchange(0)};
+        };
+        const auto m = take(map_stats);
+        const auto u = take(unmap_stats);
+        LOG_INFO(HW_Memory,
+                 "Nx2HostMap over {:.1f} s: map calls={} ({} <=64KiB) {} MiB {:.1f} ms (max "
+                 "{:.2f}); unmap calls={} views={} ({} <=64KiB) {} MiB {:.1f} ms (max {:.2f})",
+                 static_cast<double>(now_ns - last) / 1e9, m[0], m[3], m[2] >> 20,
+                 static_cast<double>(m[4]) / 1e6, static_cast<double>(m[5]) / 1e6, u[0], u[1],
+                 u[3], u[2] >> 20, static_cast<double>(u[4]) / 1e6,
+                 static_cast<double>(u[5]) / 1e6);
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
