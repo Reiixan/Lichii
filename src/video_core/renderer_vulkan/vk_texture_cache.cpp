@@ -131,9 +131,15 @@ std::atomic_bool g_uneven_bc_tail_trim{false};
     return even;
 }
 
+[[nodiscard]] bool RescalesUnevenBc(const ImageInfo& info);
+[[nodiscard]] ImageInfo RescaledBcInfo(const ImageInfo& info);
+
 [[nodiscard]] u32 HostMipCount(const VideoCommon::ImageInfo& info) {
     if (info.num_samples > 1)
         return 1;
+    if (RescalesUnevenBc(info)) {
+        return static_cast<u32>(RescaledBcInfo(info).resources.levels);
+    }
     const u32 levels =
         VideoCommon::HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
                                        static_cast<u32>(info.resources.levels));
@@ -287,10 +293,60 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return false;
 }
 
+// EDEN_NX2_UNEVEN_BC_RESCALE=1 (experiment): a large ASTC image with uneven block mips that would
+// be kept as RGBA8 (IsUnevenMipRgba8Astc) is instead re-compressed to BC at a size rounded up to
+// 256 texels, whose block mips stay even down to 12 texels; the levels below are left out, like
+// UnevenBcTailLevels. Ocarina's terrain material arrays (1365x1365x90, 11 levels) become
+// 1536x1536x90 with 8 levels: ~280 MiB of BC3 instead of 860 MiB of RGBA8 each, so they fit in
+// 8 GB cards next to everything else. Normalized coordinates sample them the same; texel
+// fetches and textureSize see the host size. EDEN_NX2_UNEVEN_BC_RESCALE_MIB=N: only images
+// whose RGBA8 copy takes N MiB or more (default 256).
+[[nodiscard]] bool RescalesUnevenBc(const ImageInfo& info) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const u64 min_bytes = [] {
+        const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ULL) << 20;
+    }();
+    if (!enabled || !g_uneven_bc_tail_trim.load(std::memory_order_relaxed) ||
+        !IsPixelFormatASTC(info.format) || info.type != ImageType::e2D || info.size.depth != 1 ||
+        info.num_samples != 1 || info.resources.levels <= 1 || info.size.width < 256 ||
+        info.size.height < 256 ||
+        Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
+        Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed) {
+        return false;
+    }
+    if (!HasUnevenBlockMips(info) || UnevenBcTailLevels(info) != 0) {
+        return false;
+    }
+    u64 rgba8_bytes = 0;
+    for (s32 level = 0; level < info.resources.levels; ++level) {
+        rgba8_bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                       (std::max)(info.size.height >> level, 1U) * 4;
+    }
+    rgba8_bytes *= static_cast<u64>(info.resources.layers);
+    // Over 1 GiB it is a huge array (IsHugeAstcArray), which keeps its own path.
+    return rgba8_bytes >= min_bytes && rgba8_bytes <= (u64{1} << 30);
+}
+
+// The host shape of a RescalesUnevenBc image: rounded up to 256 texels, with the even block mips.
+[[nodiscard]] ImageInfo RescaledBcInfo(const ImageInfo& info) {
+    ImageInfo host = info;
+    host.size.width = Common::AlignUp(info.size.width, 256U);
+    host.size.height = Common::AlignUp(info.size.height, 256U);
+    host.resources.levels = static_cast<s32>(EvenBlockMipCount(host));
+    return host;
+}
+
 // ASTC that would be re-compressed to BC1/BC3 but has uneven block mips (HasUnevenBlockMips) on
 // an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
 // arrays.
 [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
+    if (RescalesUnevenBc(info)) {
+        return false;
+    }
     // EDEN_NX2_UNEVEN_RGBA8=0: keep them as BC (the AMD sampling artifacts come back), to measure
     // what the RGBA8 copies cost in device memory (a 1365x1365x90 array: ~890 MiB vs ~225 MiB).
     static const bool rgba8_enabled = [] {
@@ -520,6 +576,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
+    if (RescalesUnevenBc(info)) {
+        return RescaledBcInfo(info);
+    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -3177,6 +3236,14 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                              info.size.width, info.size.height, info.resources.layers,
                              info.resources.levels, count);
                 }
+            } else if (RescalesUnevenBc(info)) {
+                const ImageInfo host = RescaledBcInfo(info);
+                LOG_INFO(Render_Vulkan,
+                         "ASTC {}x{}x{} with {} levels kept as BC at {}x{} with {} levels "
+                         "(uneven BC block mips, EDEN_NX2_UNEVEN_BC_RESCALE)",
+                         info.size.width, info.size.height, info.resources.layers,
+                         info.resources.levels, host.size.width, host.size.height,
+                         host.resources.levels);
             } else if (const u32 trimmed = UnevenBcTailLevels(info); trimmed != 0) {
                 static std::atomic<u32> trimmed_images{0};
                 const u32 count = ++trimmed_images;
@@ -5377,11 +5444,16 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
+    // RescalesUnevenBc: the decode keeps the guest size and the encoder resamples each level to
+    // the host size.
+    const bool rescaled = RescalesUnevenBc(info);
+    const u32 host_width = rescaled ? RescaledBcInfo(info).size.width : width;
+    const u32 host_height = rescaled ? RescaledBcInfo(info).size.height : height;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
-        const u32 level_width = (std::max)(width >> level, 1U);
-        const u32 level_height = (std::max)(height >> level, 1U);
+        const u32 level_width = (std::max)(host_width >> level, 1U);
+        const u32 level_height = (std::max)(host_height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
@@ -5404,7 +5476,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     for (u32 level = 0; level < levels; ++level) {
         bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
                                 copies[level].image_extent.height, layers, bc3, output.buffer,
-                                output.offset, total, copies[level].buffer_offset);
+                                output.offset, total, copies[level].buffer_offset,
+                                (std::max)(width >> level, 1U), (std::max)(height >> level, 1U));
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
