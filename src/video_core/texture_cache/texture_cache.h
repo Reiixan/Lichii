@@ -192,10 +192,12 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool image_failed)
         // only evicted when an image could not be made. Ocarina's terrain material arrays
         // (1365x1365x90, RGBA8 on AMD: 860 MiB each) were evicted on zone changes and recreating
         // them with VRAM full stalled 1-2.5 s. A forced collect for memory spilled to host
-        // memory is not a failure: it evicted them too, one zone later.
+        // memory is not a failure: it evicted them too, one zone later. Default 128 MiB: re-
+        // compressed to BC (RescalesUnevenBc) the two arrays take ~405 MiB together; 0 turns it
+        // off.
         static const u64 keep_costly_bytes = [] {
             const char* value = std::getenv("EDEN_NX2_TC_KEEP_COSTLY_MIB");
-            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
+            return (value != nullptr ? std::strtoull(value, nullptr, 10) : 128ULL) << 20;
         }();
         if (keep_costly_bytes != 0 && !image_failed &&
             True(image.flags & ImageFlagBits::CostlyLoad) &&

@@ -294,8 +294,9 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     return false;
 }
 
-// EDEN_NX2_UNEVEN_BC_RESCALE=1 (experiment): a large ASTC image with uneven block mips that would
-// be kept as RGBA8 (IsUnevenMipRgba8Astc) is instead re-compressed to BC at a size rounded up to
+// On by default (EDEN_NX2_UNEVEN_BC_RESCALE=0 turns it off): a large ASTC image with uneven block
+// mips that would be kept as RGBA8 (IsUnevenMipRgba8Astc) is instead re-compressed to BC at a size
+// rounded up to
 // 256 texels, whose block mips stay even down to 12 texels; the levels below are left out, like
 // UnevenBcTailLevels. Ocarina's terrain material arrays (1365x1365x90, 11 levels) become
 // 1536x1536x90 with 8 levels: ~280 MiB of BC3 instead of 860 MiB of RGBA8 each, so they fit in
@@ -305,7 +306,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 [[nodiscard]] bool RescalesUnevenBc(const ImageInfo& info) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     static const u64 min_bytes = [] {
         const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE_MIB");
