@@ -276,7 +276,11 @@ public:
         const auto start = std::chrono::steady_clock::now();
         HandedOut(host_offset, length);
         {
+            const auto lock_start = std::chrono::steady_clock::now();
             std::unique_lock lock{placeholder_mutex};
+            if (MapStatsEnabled()) {
+                map_lock_ns.fetch_add(NsSince(lock_start), std::memory_order_relaxed);
+            }
             if (!IsNiechePlaceholder(virtual_offset, length)) {
                 Split(virtual_offset, length);
             }
@@ -293,7 +297,11 @@ public:
         const auto start = std::chrono::steady_clock::now();
         u64 views = 0;
         {
+            const auto lock_start = std::chrono::steady_clock::now();
             std::scoped_lock lock{placeholder_mutex};
+            if (MapStatsEnabled()) {
+                map_lock_ns.fetch_add(NsSince(lock_start), std::memory_order_relaxed);
+            }
 
             // Unmap until there are no more placeholders
             while (UnmapOnePlaceholder(virtual_offset, length)) {
@@ -317,14 +325,32 @@ public:
     MapStats map_stats;
     MapStats unmap_stats;
     std::atomic<long long> map_stats_report_ns{};
+    // Protect calls (write traps, rasterizer caching) in the same window: they share the
+    // placeholder lock and the process address space with Map/Unmap. lock_ns: time spent getting
+    // the placeholder lock (Protect: shared; map_lock_ns: Map/Unmap, exclusive).
+    MapStats protect_stats;
+    std::atomic<u64> protect_lock_ns{};
+    std::atomic<u64> protect_fast{}; ///< Protect calls done without the placeholder lock
+    std::atomic<u64> protect_fast_failed{}; ///< Lock-free attempts refused (then done locked)
+    std::atomic<u64> map_lock_ns{};
 
-    void NoteMapStats(MapStats& stats, std::chrono::steady_clock::time_point start, size_t length,
-                      u64 views) {
+    static bool MapStatsEnabled() {
         static const bool enabled = [] {
             const char* const value = std::getenv("EDEN_NX2_STUTTER_TRACE");
             return value != nullptr && value[0] != '\0' && value[0] != '0';
         }();
-        if (!enabled) {
+        return enabled;
+    }
+
+    static u64 NsSince(std::chrono::steady_clock::time_point start) {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start)
+                                    .count());
+    }
+
+    void NoteMapStats(MapStats& stats, std::chrono::steady_clock::time_point start, size_t length,
+                      u64 views) {
+        if (!MapStatsEnabled()) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -358,13 +384,32 @@ public:
         };
         const auto m = take(map_stats);
         const auto u = take(unmap_stats);
+        const auto p = take(protect_stats);
         LOG_INFO(HW_Memory,
                  "Nx2HostMap over {:.1f} s: map calls={} ({} <=64KiB) {} MiB {:.1f} ms (max "
-                 "{:.2f}); unmap calls={} views={} ({} <=64KiB) {} MiB {:.1f} ms (max {:.2f})",
+                 "{:.2f}); unmap calls={} views={} ({} <=64KiB) {} MiB {:.1f} ms (max {:.2f}); "
+                 "map/unmap lock wait {:.1f} ms; protect calls={} views={} {} MiB {:.1f} ms "
+                 "(max {:.2f}) lock wait {:.1f} ms, {} without the lock ({} refused)",
                  static_cast<double>(now_ns - last) / 1e9, m[0], m[3], m[2] >> 20,
                  static_cast<double>(m[4]) / 1e6, static_cast<double>(m[5]) / 1e6, u[0], u[1],
                  u[3], u[2] >> 20, static_cast<double>(u[4]) / 1e6,
-                 static_cast<double>(u[5]) / 1e6);
+                 static_cast<double>(u[5]) / 1e6,
+                 static_cast<double>(map_lock_ns.exchange(0)) / 1e6, p[0], p[1], p[2] >> 20,
+                 static_cast<double>(p[4]) / 1e6, static_cast<double>(p[5]) / 1e6,
+                 static_cast<double>(protect_lock_ns.exchange(0)) / 1e6,
+                 protect_fast.exchange(0), protect_fast_failed.exchange(0));
+    }
+
+    /// Counts a Protect call without reporting (Map/Unmap write the line).
+    void NoteProtectStats(std::chrono::steady_clock::time_point start, size_t length, u64 views) {
+        const u64 ns = NsSince(start);
+        protect_stats.calls.fetch_add(1, std::memory_order_relaxed);
+        protect_stats.views.fetch_add(views, std::memory_order_relaxed);
+        protect_stats.bytes.fetch_add(length, std::memory_order_relaxed);
+        protect_stats.ns.fetch_add(ns, std::memory_order_relaxed);
+        u64 max = protect_stats.max_ns.load(std::memory_order_relaxed);
+        while (ns > max && !protect_stats.max_ns.compare_exchange_weak(max, ns)) {
+        }
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
@@ -383,9 +428,44 @@ public:
         // Shared: only Map and Unmap change the placeholders. Buffer uploads on the GPU thread
         // and write traps on the guest cores change protections at the same time, and each
         // VirtualProtect is a kernel call.
+        const bool stats = MapStatsEnabled();
+        const auto start = stats ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        // Without the lock first: a range inside one mapped view, with all its pages committed,
+        // is what nearly every call protects, and VirtualProtect does it whole. It refuses a
+        // range that reaches a placeholder, another view or an uncommitted page: a view Map or
+        // Unmap is making or taking apart, or one lazy_large has not committed yet. Those take
+        // the lock below, which gives the whole range the same flags (also any page a refused
+        // attempt might have changed). Map and Unmap hold the lock during their
+        // kernel calls, which zone changes slow down to ~250 us: protections on the GPU thread
+        // spent up to 1.5 s of 5 s waiting for it.
+        static const bool fast_protect = [] {
+            const char* const value = std::getenv("EDEN_NX2_PROTECT_FAST");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (fast_protect) {
+            DWORD old_flags{};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                if (stats) {
+                    protect_fast.fetch_add(1, std::memory_order_relaxed);
+                    NoteProtectStats(start, length, 1);
+                }
+                return;
+            }
+            if (stats) {
+                protect_fast_failed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        const auto lock_start = stats ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         std::shared_lock lock{placeholder_mutex};
+        if (stats) {
+            protect_lock_ns.fetch_add(NsSince(lock_start), std::memory_order_relaxed);
+        }
+        u64 views = 0;
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
+            ++views;
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
             const auto host_it = placeholder_host_pointers.find(it->lower());
@@ -396,6 +476,9 @@ public:
                 ProtectView(offset, protect_length, new_flags);
             }
             ++it;
+        }
+        if (stats) {
+            NoteProtectStats(start, length, views);
         }
     }
 
@@ -420,6 +503,16 @@ public:
         const auto chunk_end = [host_end](size_t offset) {
             return (std::min)(((offset >> CommitChunkShift) + 1) << CommitChunkShift, host_end);
         };
+        // A chunk EnsureCommitted is committing has its pages committed before its mark: a
+        // lock-free Protect (see Protect) may have trapped them in between. Wait for that commit
+        // to finish and mark them, or they would be skipped below and stay trapped.
+        std::unique_lock<std::mutex> commit_lock;
+        for (size_t run = host_offset; run < host_end; run = chunk_end(run)) {
+            if (!IsCommittedAt(run)) {
+                commit_lock = std::unique_lock{commit_mutex};
+                break;
+            }
+        }
         for (size_t run = host_offset; run < host_end;) {
             const bool committed = IsCommittedAt(run);
             size_t run_end = chunk_end(run);
