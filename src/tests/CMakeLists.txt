@@ -187,6 +187,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/host_wait_margin.cpp
     core/local_redirect.cpp
     core/nextendo_redirect.cpp
     core/thread_startup_policy.cpp
