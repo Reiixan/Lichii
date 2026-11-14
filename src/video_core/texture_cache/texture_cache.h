@@ -142,7 +142,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
-void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool image_failed) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -178,7 +178,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
     };
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
-                           out_of_memory](ImageId image_id, bool* out_must_download = nullptr) {
+                           image_failed](ImageId image_id, bool* out_must_download = nullptr) {
         const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
@@ -189,14 +189,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             *out_must_download = must_download;
         }
         // EDEN_NX2_TC_KEEP_COSTLY_MIB=N: costly images (ASTC conversions) of N MiB or more are
-        // only evicted when an allocation failed. Ocarina's terrain material arrays (1365x1365x90,
-        // RGBA8 on AMD: 860 MiB each) were evicted on zone changes and recreating them with VRAM
-        // full stalled 1-2.5 s.
+        // only evicted when an image could not be made. Ocarina's terrain material arrays
+        // (1365x1365x90, RGBA8 on AMD: 860 MiB each) were evicted on zone changes and recreating
+        // them with VRAM full stalled 1-2.5 s. A forced collect for memory spilled to host
+        // memory is not a failure: it evicted them too, one zone later.
         static const u64 keep_costly_bytes = [] {
             const char* value = std::getenv("EDEN_NX2_TC_KEEP_COSTLY_MIB");
             return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
         }();
-        if (keep_costly_bytes != 0 && !out_of_memory &&
+        if (keep_costly_bytes != 0 && !image_failed &&
             True(image.flags & ImageFlagBits::CostlyLoad) &&
             ImageMemoryBytes(image) >= keep_costly_bytes) {
             return false;
@@ -1014,7 +1015,7 @@ void TextureCache<P>::TickFrame() {
     // A forced collect for memory spilled to host memory collects as at the critical threshold
     // for this frame, without the re-upload of images left out that a failed image gets.
     if (out_of_memory || spill_collect || total_used_memory > minimum_memory) {
-        RunGarbageCollector(out_of_memory || spill_collect);
+        RunGarbageCollector(out_of_memory || spill_collect, out_of_memory);
     }
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
@@ -3224,7 +3225,14 @@ u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
         True(image.flags & ImageFlagBits::Converted)) {
         tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
     }
-    return Common::AlignUp(tentative_size, 1024);
+    const u64 estimate = Common::AlignUp(tentative_size, 1024);
+    // The estimate assumes ASTC lands as BC, but uneven-mip ASTC is kept as RGBA8 on AMD: the
+    // terrain material arrays (1365x1365x90) were counted as 225 MiB while taking 860. The
+    // allocation never changes while the image lives, so additions and removals still match.
+    if constexpr (requires { image.MemoryBlock(); }) {
+        return (std::max)(estimate, image.MemoryBlock().size);
+    }
+    return estimate;
 }
 
 template <class P>
