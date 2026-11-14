@@ -324,6 +324,9 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    u32 transcode_creates = 0; ///< Decode images made since the last Nx2Transcode line.
+    u32 transcode_reuses = 0;  ///< Decode images reused since the last Nx2Transcode line.
+    u32 transcode_log_frames = 0;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

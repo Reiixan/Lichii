@@ -29,6 +29,7 @@
 #include <atomic>
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/fsr.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -3133,6 +3134,17 @@ void TextureCacheRuntime::TickFrame() {
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
     }
+    // EDEN_NX2_STUTTER_TRACE: ASTC->BC decode images made and reused, every ~5 s with activity.
+    if (++transcode_log_frames >= 300) {
+        transcode_log_frames = 0;
+        if ((transcode_creates != 0 || transcode_reuses != 0) &&
+            VideoCommon::StutterTrace::Enabled()) {
+            LOG_INFO(Render_Vulkan, "Nx2Transcode decode images made={} reused={} in_flight={} free={}",
+                     transcode_creates, transcode_reuses, pending_transcodes.size(),
+                     free_transcodes.size());
+        }
+        transcode_creates = transcode_reuses = 0;
+    }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
     // Finished decode images wait for the next texture of their shape, up to this much memory.
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
@@ -5368,9 +5380,28 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // time: Ocarina's terrain material arrays (1365x1365x90) took an 860 MiB dedicated decode
     // image each, which stalled 80-230 ms with VRAM full and once landed in host memory.
     constexpr u64 MaxDecodeBytes = u64{128} << 20;
+    // EDEN_NX2_TRANSCODE_REUSE=0 turns this off: a decode image at least as large as this
+    // texture is reused at once, even while the GPU still works on its last decode (commands run
+    // in submission order and the decode starts with a barrier after the encoder's reads). Each
+    // new texture took a dedicated decode image of its exact shape: a zone change in Ocarina
+    // created ~430 of them (1.7 GB) in a second, ~220 ms of allocations alone. New decode
+    // images are made a size class larger, so later textures of other shapes fit too.
+    static const bool reuse_larger = [] {
+        const char* const value = std::getenv("EDEN_NX2_TRANSCODE_REUSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto size_class = [](u32 size) {
+        return size <= 512 ? std::bit_ceil((std::max)(size, 4U)) : Common::AlignUp(size, 512U);
+    };
+    const u32 decode_width = reuse_larger ? size_class(width) : width;
+    const u32 decode_height = reuse_larger ? size_class(height) : height;
+    const u32 decode_levels =
+        reuse_larger ? static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height)))
+                     : levels;
     u64 layer_bytes = 0;
-    for (u32 level = 0; level < levels; ++level) {
-        layer_bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+    for (u32 level = 0; level < decode_levels; ++level) {
+        layer_bytes += u64{(std::max)(decode_width >> level, 1U)} *
+                       (std::max)(decode_height >> level, 1U) * 4;
     }
     const u32 batch_layers =
         layer_bytes * layers > MaxDecodeBytes && info.layer_stride != 0
@@ -5382,23 +5413,53 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels &&
-               t.layers == batch_layers;
-    });
+    const auto fits = [&](const PendingTranscode& t) {
+        if (!reuse_larger) {
+            return t.width == width && t.height == height && t.levels == levels &&
+                   t.layers == batch_layers;
+        }
+        return t.width >= width && t.height >= height && t.levels >= levels &&
+               t.layers >= batch_layers;
+    };
+    const auto smaller = [](const PendingTranscode& a, const PendingTranscode& b) {
+        return u64{a.width} * a.height * a.layers < u64{b.width} * b.height * b.layers;
+    };
     PendingTranscode pending;
+    bool reused = false;
+    auto reusable = free_transcodes.end();
+    for (auto it = free_transcodes.begin(); it != free_transcodes.end(); ++it) {
+        if (fits(*it) && (reusable == free_transcodes.end() || smaller(*it, *reusable))) {
+            reusable = it;
+        }
+    }
+    auto in_flight = pending_transcodes.end();
+    if (reuse_larger && reusable == free_transcodes.end()) {
+        for (auto it = pending_transcodes.begin(); it != pending_transcodes.end(); ++it) {
+            if (fits(*it) && (in_flight == pending_transcodes.end() || smaller(*it, *in_flight))) {
+                in_flight = it;
+            }
+        }
+    }
     if (reusable != free_transcodes.end()) {
         pending = std::move(*reusable);
         free_transcodes.erase(reusable);
+        reused = true;
+        ++transcode_reuses;
+    } else if (in_flight != pending_transcodes.end()) {
+        pending = std::move(*in_flight);
+        pending_transcodes.erase(in_flight);
+        reused = true;
+        ++transcode_reuses;
     } else {
+        ++transcode_creates;
         const VkImageCreateInfo decode_ci{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .imageType = VK_IMAGE_TYPE_2D,
             .format = DecodeFormat,
-            .extent = {width, height, 1},
-            .mipLevels = levels,
+            .extent = {decode_width, decode_height, 1},
+            .mipLevels = decode_levels,
             .arrayLayers = batch_layers,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -5430,13 +5491,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .tick = 0,
             .image = std::move(decode),
             .views = {},
-            .width = width,
-            .height = height,
-            .levels = levels,
+            .width = decode_width,
+            .height = decode_height,
+            .levels = decode_levels,
             .layers = batch_layers,
             .unused_frames = 0,
         };
-        for (u32 level = 0; level < levels; ++level) {
+        for (u32 level = 0; level < decode_levels; ++level) {
             pending.views.push_back(
                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
         }
@@ -5489,7 +5550,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             ASTCDecoderPass::Target{
                 .image = *pending.image,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .initialized = first != 0,
+                // A reused decode image may still be read by an encode in flight: the barrier
+                // has to wait for it (initialized), not start from top of pipe.
+                .initialized = reused || first != 0,
                 .level_view = [&pending](s32 level) { return *pending.views[level]; },
                 .wait = true,
                 .levels = levels,
