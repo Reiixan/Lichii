@@ -159,12 +159,18 @@ TEST_CASE("ShaderPrecache: a file from an older builder or another cache version
     WriteBytes(count, fmt::format("0 13 {}\n", ShaderWarm::WarmBuilderVersion));
     REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
     WriteBytes(count, fmt::format("0 12 {}\n", ShaderWarm::WarmBuilderVersion));
-    // The emulator loads a file of a compatible older version, so it is not built again.
+    // The emulator loads a file of a compatible older version, so it is not built again. The list
+    // can be empty (a cache version change that keeps no older one): front() would read past it.
     const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
-    WriteBytes(warm, header(compatible.front()));
-    REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
-    WriteBytes(warm, header(compatible.back() - 1));
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    if (!compatible.empty()) {
+        WriteBytes(warm, header(compatible.front()));
+        REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
+        WriteBytes(warm, header(compatible.back() - 1));
+        REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    } else {
+        WriteBytes(warm, header(ShaderWarm::WarmCacheVersion - 1));
+        REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    }
 }
 
 TEST_CASE("ShaderPrecache: a compute entry reads back like a pipeline cache entry",

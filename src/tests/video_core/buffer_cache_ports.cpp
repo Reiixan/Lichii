@@ -2844,6 +2844,8 @@ TEST_CASE("Claimed CPU writes keep their bytes when an earlier one downloads the
         for (const auto& [address, size] : ranges) {
             f.cache->WriteMemory(address, size);
         }
+        // The count of GPU threads is global: left at 1, later tests saw a GPU thread run.
+        VideoCommon::GpuSplit::UnmarkGpuThread();
     }}.join();
     Tegra::g_nx2_ampere.store(ampere);
     REQUIRE(f.bytes[0x10000] == 0x12);
