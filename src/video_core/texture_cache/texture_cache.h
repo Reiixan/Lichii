@@ -177,8 +177,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             }
         }
     };
-    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode,
-                           &evict_old_costly](ImageId image_id, bool* out_must_download = nullptr) {
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
+                           out_of_memory](ImageId image_id, bool* out_must_download = nullptr) {
         const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
@@ -187,6 +187,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
         if (out_must_download != nullptr) {
             *out_must_download = must_download;
+        }
+        // EDEN_NX2_TC_KEEP_COSTLY_MIB=N: costly images (ASTC conversions) of N MiB or more are
+        // only evicted when an allocation failed. Ocarina's terrain material arrays (1365x1365x90,
+        // RGBA8 on AMD: 860 MiB each) were evicted on zone changes and recreating them with VRAM
+        // full stalled 1-2.5 s.
+        static const u64 keep_costly_bytes = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_KEEP_COSTLY_MIB");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
+        }();
+        if (keep_costly_bytes != 0 && !out_of_memory &&
+            True(image.flags & ImageFlagBits::CostlyLoad) &&
+            ImageMemoryBytes(image) >= keep_costly_bytes) {
+            return false;
         }
         if ((!aggressive_mode && !evict_old_costly &&
              True(image.flags & ImageFlagBits::CostlyLoad)) ||
@@ -4532,6 +4545,19 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete,
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     ++churn.deleted;
+    // EDEN_NX2_STUTTER_TRACE: who deletes images of 64 MiB or more (line of the caller: the
+    // garbage collector, an unmap, or an overlap join) and how long after their creation.
+    if (VideoCommon::StutterTrace::Enabled() &&
+        ImageMemoryBytes(slot_images[image_id]) >= (u64{64} << 20)) {
+        LOG_INFO(HW_GPU,
+                 "Nx2DeleteImage {}x{}x{} levels={} format={} gpu_addr={:#x} size_mib={} line={} "
+                 "frames_alive={} costly={} used_mib={} critical_mib={}",
+                 image.info.size.width, image.info.size.height, image.info.resources.layers,
+                 image.info.resources.levels, static_cast<u32>(image.info.format), image.gpu_addr,
+                 ImageMemoryBytes(slot_images[image_id]) >> 20, location.line(),
+                 frame_tick - slot_images[image_id].allocation_tick, True(image.flags & ImageFlagBits::CostlyLoad),
+                 total_used_memory >> 20, critical_memory >> 20);
+    }
     if (VideoCommon::Nx2Profile::Enabled() &&
         VideoCore::Surface::IsPixelFormatASTC(image.info.format)) {
         ++astc_churn.deleted;
