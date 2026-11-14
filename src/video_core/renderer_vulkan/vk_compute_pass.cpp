@@ -192,6 +192,8 @@ struct AstcPushConstants {
     u32 block_height;
     u32 block_height_mask;
     u32 native_tiling;
+    u32 pad;                         // uvec2 level_extent is 8-byte aligned
+    std::array<u32, 2> level_extent; // texels of the decoded level (astc_decoder.comp)
 };
 
 constexpr std::array<VkDescriptorSetLayoutBinding, 2> BC_ENCODER_DESCRIPTOR_SET_BINDINGS{{
@@ -821,10 +823,13 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 target.layer_view(swizzle.level - static_cast<s32>(skip), target.layers[i]));
             const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
             auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+            const std::array<u32, 2> level_extent{
+                (std::max)(info.size.width >> swizzle.level, 1U),
+                (std::max)(info.size.height >> swizzle.level, 1U)};
             params.layer_stride = input_layer_stride;
             const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
             const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
-            scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
+            scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params, level_extent,
                               descriptor_data](vk::CommandBuffer cmdbuf) {
                 const AstcPushConstants uniforms{
                     .blocks_dims = block_dims,
@@ -834,6 +839,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     .block_height = params.block_height,
                     .block_height_mask = params.block_height_mask,
                     .native_tiling = params.native_tiling,
+                    .pad = 0,
+                    .level_extent = level_extent,
                 };
                 const VkDescriptorSet set = descriptor_allocator.Commit();
                 device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
@@ -862,11 +869,13 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
 
         // To unswizzle the ASTC data
         auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
+        const std::array<u32, 2> level_extent{(std::max)(info.size.width >> swizzle.level, 1U),
+                                              (std::max)(info.size.height >> swizzle.level, 1U)};
         params.layer_stride = input_layer_stride;
         ASSERT(params.origin == (std::array<u32, 3>{0, 0, 0}));
         ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
         ASSERT(params.bytes_per_block_log2 == 4);
-        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
+        scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims, level_extent,
                           params, descriptor_data](vk::CommandBuffer cmdbuf) {
             const AstcPushConstants uniforms{
                 .blocks_dims = block_dims,
@@ -876,6 +885,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .block_height = params.block_height,
                 .block_height_mask = params.block_height_mask,
                 .native_tiling = params.native_tiling,
+                .pad = 0,
+                .level_extent = level_extent,
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);

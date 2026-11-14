@@ -543,6 +543,11 @@ public:
         return original_image.GetMemoryBlock();
     }
 
+    /// Re-compressed to BC at a rounded-up size (RescalesUnevenBc): the collector keeps it.
+    [[nodiscard]] bool IsRescaledBc() const noexcept {
+        return rescaled_bc;
+    }
+
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
         return std::exchange(initialized, true);
@@ -593,6 +598,7 @@ public:
     bool ScaleDown(bool ignore = false);
 
     u64 allocation_tick;
+    bool rescaled_bc = false; ///< See IsRescaledBc.
 
     friend class BlockLinearUnswizzle3DPass;
 

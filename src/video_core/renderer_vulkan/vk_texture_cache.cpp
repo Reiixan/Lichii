@@ -3250,6 +3250,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                              info.resources.levels, count);
                 }
             } else if (RescalesUnevenBc(info)) {
+                rescaled_bc = true;
                 const ImageInfo host = RescaledBcInfo(info);
                 LOG_INFO(Render_Vulkan,
                          "ASTC {}x{}x{} with {} levels kept as BC at {}x{} with {} levels "
@@ -5536,7 +5537,14 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         });
         total += size;
     }
-    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
+    // Deferred, and stamped once the copy below is recorded: a decode submits (wait), so a buffer
+    // stamped now carried the decode's tick while the encode and the copy ran a tick later, and
+    // the pool could free it, or hand it out again, once the GPU was past the decode.
+    auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
+    // Batches don't submit between them: `map` carries this tick, and a later batch reading it a
+    // submit later could find it freed or refilled with the next upload (another texture's
+    // layers). The decode image is never sampled, so nothing needs the submit.
+    const bool batched = batch_layers < layers;
     // Each layer's guest data is its whole mip chain (layer_stride bytes), so a batch of layers
     // is a slice of the input; its blocks land after the previous layers' in each level.
     for (u32 first = 0; first < layers; first += batch_layers) {
@@ -5555,7 +5563,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 // has to wait for it (initialized), not start from top of pipe.
                 .initialized = reused || first != 0,
                 .level_view = [&pending](s32 level) { return *pending.views[level]; },
-                .wait = true,
+                .wait = !batched,
                 .levels = levels,
             },
             batch_map, swizzles);
@@ -5583,6 +5591,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
+    staging_buffer_pool.FreeDeferred(output);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
 }

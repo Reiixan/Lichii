@@ -192,17 +192,33 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool image_failed)
         // only evicted when an image could not be made. Ocarina's terrain material arrays
         // (1365x1365x90, RGBA8 on AMD: 860 MiB each) were evicted on zone changes and recreating
         // them with VRAM full stalled 1-2.5 s. A forced collect for memory spilled to host
-        // memory is not a failure: it evicted them too, one zone later. Default 128 MiB: re-
-        // compressed to BC (RescalesUnevenBc) the two arrays take ~405 MiB together; 0 turns it
-        // off.
+        // memory is not a failure: it evicted them too, one zone later. Off by default for other
+        // images: kept at any size in any title, another title's trimmed huge ASTC arrays (256-512
+        // MiB each) would stay too, and 1.7 GB kept on an 8 GB card sent ~6 GB of other textures
+        // to host memory.
         static const u64 keep_costly_bytes = [] {
             const char* value = std::getenv("EDEN_NX2_TC_KEEP_COSTLY_MIB");
-            return (value != nullptr ? std::strtoull(value, nullptr, 10) : 128ULL) << 20;
+            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
         }();
         if (keep_costly_bytes != 0 && !image_failed &&
             True(image.flags & ImageFlagBits::CostlyLoad) &&
             ImageMemoryBytes(image) >= keep_costly_bytes) {
             return false;
+        }
+        // By default only the images the backend re-compresses at a rounded-up size (Vulkan's
+        // RescalesUnevenBc, AMD: Ocarina's terrain material arrays, ~405 MiB together) are kept
+        // this way, which is what was measured. EDEN_NX2_TC_KEEP_RESCALED=0 evicts them as before.
+        static const bool keep_rescaled = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_KEEP_RESCALED");
+            return value == nullptr || value[0] != '0';
+        }();
+        if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+            // Not once the game unmapped its GPU range (Remapped): nothing reads it again, and a
+            // title that does so on every zone change would pile them up.
+            if (keep_rescaled && !image_failed && image.IsRescaledBc() &&
+                False(image.flags & ImageFlagBits::Remapped)) {
+                return false;
+            }
         }
         if ((!aggressive_mode && !evict_old_costly &&
              True(image.flags & ImageFlagBits::CostlyLoad)) ||
