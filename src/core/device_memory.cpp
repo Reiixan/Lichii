@@ -3,6 +3,7 @@
 #ifdef _WIN32
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <new>
@@ -72,6 +73,27 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 break;
             }
         }
+        // Read here, not at construction: the beside-application switches file may be applied
+        // after the device memory is made.
+        // EDEN_NX2_ZERO_TRIM=0: no passes (to measure what they cost guest memory maps).
+        static const bool trim_enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_ZERO_TRIM");
+            return value == nullptr || value[0] != '0';
+        }();
+        // EDEN_NX2_STUTTER_TRACE: every pass, with when it starts. Guest memory maps took ~250 us
+        // instead of ~10 us for seconds at Ocarina's zone changes, and a pass holds the working
+        // set for about a second.
+        static const bool trace = [] {
+            const char* const value = std::getenv("EDEN_NX2_STUTTER_TRACE");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (!trim_enabled) {
+            interval = std::chrono::seconds{300};
+            continue;
+        }
+        if (trace) {
+            LOG_INFO(HW_Memory, "Nx2ZeroTrim pass starts");
+        }
         const auto start = std::chrono::steady_clock::now();
         std::pair<size_t, size_t> result;
         try {
@@ -92,6 +114,10 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+        if (trace) {
+            LOG_INFO(HW_Memory, "Nx2ZeroTrim pass ends: {} ms, trimmed {} MiB of {} MiB resident",
+                     ms, trimmed >> 20, resident >> 20);
+        }
         if (const auto committed = buffer.CommittedBackingBytes();
             committed && *committed >= logged_committed + CommitLogStep) {
             logged_committed = *committed;
