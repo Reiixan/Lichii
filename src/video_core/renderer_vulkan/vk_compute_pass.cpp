@@ -192,8 +192,7 @@ struct AstcPushConstants {
     u32 block_height;
     u32 block_height_mask;
     u32 native_tiling;
-    u32 pad;                         // uvec2 level_extent is 8-byte aligned
-    std::array<u32, 2> level_extent; // texels of the decoded level (astc_decoder.comp)
+    std::array<u32, 2> level_extent; // texels of the decoded level; offset 32 like the shader
 };
 
 constexpr std::array<VkDescriptorSetLayoutBinding, 2> BC_ENCODER_DESCRIPTOR_SET_BINDINGS{{
@@ -839,7 +838,6 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     .block_height = params.block_height,
                     .block_height_mask = params.block_height_mask,
                     .native_tiling = params.native_tiling,
-                    .pad = 0,
                     .level_extent = level_extent,
                 };
                 const VkDescriptorSet set = descriptor_allocator.Commit();
@@ -885,7 +883,6 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .block_height = params.block_height,
                 .block_height_mask = params.block_height_mask,
                 .native_tiling = params.native_tiling,
-                .pad = 0,
                 .level_extent = level_extent,
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
