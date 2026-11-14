@@ -34,6 +34,7 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include <ranges>
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -349,6 +350,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
+    const auto create_start = std::chrono::steady_clock::now();
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -403,6 +405,20 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     }
 
     NoteHostPlacement(allocation, alloc_info.size, true);
+
+    // EDEN_NX2_STUTTER_TRACE: which images take 64 MiB or more (Nx2AllocSlow only has the size):
+    // shape, format and usage tell a texture (sampled) from a transcode scratch image (storage).
+    if (VideoCommon::StutterTrace::Enabled() && alloc_info.size >= (u64{64} << 20)) {
+        LOG_INFO(Render_Vulkan,
+                 "Nx2AllocImage {}x{}x{} levels={} layers={} format={} usage={:#x} dedicated={} "
+                 "size_mib={} ms={:.1f}",
+                 ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels, ci.arrayLayers,
+                 static_cast<u32>(ci.format), static_cast<u32>(ci.usage), dedicated,
+                 alloc_info.size >> 20,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                           create_start)
+                     .count());
+    }
 
     // Log GPU memory allocation for images
     if (GPU::Logging::IsActive() &&
