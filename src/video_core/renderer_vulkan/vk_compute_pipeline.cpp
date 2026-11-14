@@ -220,6 +220,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
       shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
+        build_notify = shader_notify;
     }
     std::copy_n(info.constant_buffer_used_sizes.begin(), uniform_buffer_sizes.size(),
                 uniform_buffer_sizes.begin());
@@ -325,7 +326,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             is_built = true;
             build_condvar.notify_one();
             if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+                NotifyBuilt();
             }
             return;
         }
@@ -347,7 +348,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         is_built = true;
         build_condvar.notify_one();
         if (shader_notify) {
-            shader_notify->MarkShaderComplete();
+            NotifyBuilt();
         }
     }};
     build_task = std::move(func);
@@ -372,7 +373,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                     is_built = true;
                     build_condvar.notify_one();
                     if (shader_notify) {
-                        shader_notify->MarkShaderComplete();
+                        NotifyBuilt();
                     }
                 };
                 try {
@@ -400,6 +401,14 @@ ComputePipeline::~ComputePipeline() {
         // Nothing needs a pipeline that goes: a build still queued is dropped.
         jobs->Cancel(job);
         job.Wait();
+    }
+    // A dropped build never ran, and never counted itself as done.
+    NotifyBuilt();
+}
+
+void ComputePipeline::NotifyBuilt() noexcept {
+    if (build_notify != nullptr && !build_notified.exchange(true)) {
+        build_notify->MarkShaderComplete();
     }
 }
 
