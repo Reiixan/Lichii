@@ -300,6 +300,23 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     if (!rgba8_enabled) {
         return false;
     }
+    // EDEN_NX2_UNEVEN_RGBA8_MAX_MIB=N: only images whose RGBA8 copy takes at most N MiB stay
+    // RGBA8; larger ones (Ocarina of Time's 1365x1365x90 arrays: 860 MiB each) stay BC, to find
+    // which images the AMD sampling artifacts come from.
+    static const u64 rgba8_max_bytes = [] {
+        const char* const value = std::getenv("EDEN_NX2_UNEVEN_RGBA8_MAX_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : ~u64{0};
+    }();
+    if (rgba8_max_bytes != ~u64{0}) {
+        u64 bytes = 0;
+        for (s32 level = 0; level < info.resources.levels; ++level) {
+            bytes += u64{(std::max)(info.size.width >> level, 1U)} *
+                     (std::max)(info.size.height >> level, 1U) * 4;
+        }
+        if (bytes * static_cast<u64>(info.resources.layers) > rgba8_max_bytes) {
+            return false;
+        }
+    }
     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
