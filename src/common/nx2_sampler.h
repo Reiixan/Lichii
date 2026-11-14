@@ -21,6 +21,11 @@ namespace Nx2Sampler {
 // frames have been presented, each time no frame comes for that long the threads (CPUCore_* when
 // EDEN_NX2_SAMPLE is not set) are sampled for EDEN_NX2_SAMPLE_SECONDS (default 20); the reports
 // go to <EDEN_NX2_SAMPLE_OUT>.stall<N>.txt, eight at most.
+//
+// EDEN_NX2_SAMPLE_SLOW_MS=<ms>: once 600 frames have been presented, the threads (CPUCore_*
+// when EDEN_NX2_SAMPLE is not set) are sampled all the time, but only the samples taken during
+// frames of at least that many milliseconds are kept: <EDEN_NX2_SAMPLE_OUT>.slow.txt holds them
+// all (rewritten every 8 slow frames) and .slow.txt.frames.txt lists each slow frame.
 void StartFromEnvironment();
 
 inline std::atomic<long long> g_last_frame_ns{};

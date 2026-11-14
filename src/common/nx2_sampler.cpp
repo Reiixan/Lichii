@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <string>
@@ -490,6 +491,95 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
 
 } // Anonymous namespace
 
+// EDEN_NX2_SAMPLE_SLOW_MS: samples the threads all the time but keeps only the samples taken
+// during frames that took at least `slow_ms`, so short hitches (100-500 ms at Ocarina's zone
+// changes, mostly on the guest cores) are profiled and the smooth frames around them are not.
+void SampleSlowFrames(const std::vector<std::string>& patterns, double slow_ms,
+                      const std::string& out) {
+    constexpr unsigned long long ArmFrames = 600;
+    constexpr size_t MaxKept = 200000;
+    constexpr unsigned ReportEvery = 8;
+    while (g_frames.load(std::memory_order_relaxed) < ArmFrames) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    }
+    const std::vector<Target> targets = FindThreads(patterns);
+    std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling frames over %.0f ms\n",
+                 targets.size(), slow_ms);
+    if (targets.empty()) {
+        return;
+    }
+    const Modules modules = LoadedModules();
+    const long long slow_ns = static_cast<long long>(slow_ms * 1e6);
+    std::deque<std::pair<long long, struct Sample>> recent;
+    std::vector<struct Sample> kept;
+    kept.reserve(MaxKept);
+    unsigned long long seen_frames = g_frames.load(std::memory_order_relaxed);
+    long long frame_start = g_last_frame_ns.load(std::memory_order_relaxed);
+    unsigned slow_frames = 0;
+    unsigned reported = 0;
+    std::FILE* const frames_file = std::fopen((out + ".frames.txt").c_str(), "w");
+    while (kept.size() + recent.size() < MaxKept) {
+        const long long now = NowNs();
+        for (unsigned i = 0; i < targets.size(); ++i) {
+            const HANDLE handle = targets[i].handle;
+            if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+                continue;
+            }
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(handle, &context)) {
+                auto& [ns, sample] = recent.emplace_back();
+                ns = now;
+                sample.thread = i;
+                sample.depth = GuardedWalk(context, sample.frames, targets[i].tib, modules,
+                                           sample.faulted);
+            }
+            ResumeThread(handle);
+        }
+        const unsigned long long frames = g_frames.load(std::memory_order_relaxed);
+        if (frames != seen_frames) {
+            const long long frame_end = g_last_frame_ns.load(std::memory_order_relaxed);
+            const long long length = frame_end - frame_start;
+            if (length >= slow_ns) {
+                size_t taken = 0;
+                for (const auto& [ns, sample] : recent) {
+                    if (ns >= frame_start && ns <= frame_end) {
+                        kept.push_back(sample);
+                        ++taken;
+                    }
+                }
+                ++slow_frames;
+                if (frames_file != nullptr) {
+                    std::fprintf(frames_file, "frame %llu ms=%.1f samples=%zu\n", frames,
+                                 static_cast<double>(length) / 1e6, taken);
+                    std::fflush(frames_file);
+                }
+            }
+            seen_frames = frames;
+            frame_start = frame_end;
+            while (!recent.empty() && recent.front().first < frame_start) {
+                recent.pop_front();
+            }
+            if (slow_frames >= reported + ReportEvery) {
+                reported = slow_frames;
+                static std::mutex report_mutex;
+                std::scoped_lock report_lock{report_mutex};
+                Report(targets, kept, out.c_str());
+            }
+        }
+        // A frame that never ends (a loading screen) keeps at most ~10 s of samples.
+        while (recent.size() > 10000 * targets.size()) {
+            recent.pop_front();
+        }
+        Sleep(1);
+    }
+    if (frames_file != nullptr) {
+        std::fclose(frames_file);
+    }
+    std::fprintf(stderr, "nx2 sampler: slow-frame sampling stopped (%zu samples kept)\n",
+                 kept.size());
+}
+
 std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
 }
@@ -497,11 +587,19 @@ std::string Sample(const char* names, double seconds, const std::string& out) {
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
     const double stall = EnvSeconds("EDEN_NX2_SAMPLE_STALL", 0.0);
+    const double slow_ms = EnvSeconds("EDEN_NX2_SAMPLE_SLOW_MS", 0.0);
     const bool has_names = names != nullptr && *names != '\0';
-    if (!has_names && stall <= 0.0) {
+    if (!has_names && stall <= 0.0 && slow_ms <= 0.0) {
         return;
     }
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
+    if (slow_ms > 0.0) {
+        std::thread{[patterns = SplitNames(has_names ? names : "CPUCore_*"), slow_ms,
+                     out = std::string{out != nullptr ? out : "nx2_samples.txt"}] {
+            SampleSlowFrames(patterns, slow_ms, out + ".slow.txt");
+        }}.detach();
+        return;
+    }
     if (stall > 0.0) {
         std::thread{[patterns = SplitNames(has_names ? names : "CPUCore_*"), stall,
                      seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 20.0),
