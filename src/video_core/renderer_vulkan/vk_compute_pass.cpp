@@ -235,7 +235,9 @@ struct BcEncoderPushConstants {
     u32 width;
     u32 height;
     u32 bc3;
-    u32 out_offset; // in 8-byte units
+    u32 out_offset;    // in 8-byte units
+    u32 source_width;  // != width: resample the source level (RescalesUnevenBc)
+    u32 source_height;
 };
 
 struct QueriesPrefixScanPushConstants {
@@ -862,7 +864,7 @@ BcEncoderPass::~BcEncoderPass() = default;
 
 void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3,
                            VkBuffer buffer, VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
-                           VkDeviceSize out_offset) {
+                           VkDeviceSize out_offset, u32 source_width, u32 source_height) {
     scheduler.RequestOutsideRenderPassOperationContext();
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
     compute_pass_descriptor_queue.AddImage(source);
@@ -875,6 +877,8 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         .height = height,
         .bc3 = bc3 ? 1U : 0U,
         .out_offset = static_cast<u32>(out_offset / 8),
+        .source_width = source_width != 0 ? source_width : width,
+        .source_height = source_height != 0 ? source_height : height,
     };
     const VkPipeline vk_pipeline = *pipeline;
     scheduler.Record([this, vk_pipeline, uniforms, layers, descriptor_data](vk::CommandBuffer cmdbuf) {
