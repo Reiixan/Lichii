@@ -536,17 +536,6 @@ private:
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
-    /// Downloads a whole image into guest memory, waiting for the GPU (clears GpuModified).
-    void WriteBackImage(Image& image);
-
-    /// Either image re-compressed by the backend at another size (IsRescaledBc): copies in
-    /// guest extents between the two can't be made.
-    [[nodiscard]] bool IsRescaledPair(const ImageBase& lhs, const ImageBase& rhs) const noexcept;
-
-    /// Writes what the GPU wrote to an image back to guest memory before guest memory stands in
-    /// for a copy to or from a re-compressed image; logs when it can't be downloaded.
-    void WriteBackForRescaled(Image& image);
-
     void RefreshContents(Image& image, ImageId image_id);
 
     /// Upload data from guest to an image
