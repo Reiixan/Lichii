@@ -239,13 +239,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool image_failed)
         --num_iterations;
         auto& image = slot_images[image_id];
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            WriteBackImage(image);
             ++gc_download_deletes;
-            ClearStaleImage(image);
         } else {
             MarkStale(image); // before UntrackImage (see MarkStale)
         }
@@ -1746,6 +1741,46 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
     } else {
         return false;
     }
+}
+
+template <class P>
+void TextureCache<P>::WriteBackImage(Image& image) {
+    auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+    const auto copies = FullDownloadCopies(image.info);
+    image.DownloadMemory(map, copies);
+    runtime.Finish();
+    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                 swizzle_data_buffer);
+    image.flags &= ~ImageFlagBits::GpuModified;
+    ClearStaleImage(image);
+}
+
+template <class P>
+bool TextureCache<P>::IsRescaledPair(const ImageBase& lhs, const ImageBase& rhs) const noexcept {
+    if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+        return static_cast<const Image&>(lhs).IsRescaledBc() ||
+               static_cast<const Image&>(rhs).IsRescaledBc();
+    } else {
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::WriteBackForRescaled(Image& image) {
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    if (!IsDownloadable(image)) {
+        static u32 logged{};
+        if (logged++ < 16) {
+            LOG_WARNING(HW_GPU,
+                        "GPU-written image at {:#x} overlaps a re-compressed BC image and can't "
+                        "be written back to guest memory; its contents are lost",
+                        image.gpu_addr);
+        }
+        return;
+    }
+    WriteBackImage(image);
 }
 
 template <class P>
@@ -3818,14 +3853,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     // Copies between the new image and an overlap are made from guest extents. An image the
     // backend re-compressed at another size (IsRescaledBc) does not have those: no copy is made
-    // to or from one, and the new image gets its contents from guest memory instead.
+    // to or from one, and the new image gets its contents from guest memory instead. What the
+    // GPU wrote to such an overlap is written back to guest memory first, oldest first (copies
+    // are sorted by tick above), so the upload below reads it.
     const auto rescaled_pair = [&](const Image& overlap) {
-        if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
-            return overlap.IsRescaledBc() || new_image.IsRescaledBc();
-        } else {
-            return false;
-        }
+        return IsRescaledPair(overlap, new_image);
     };
+    for (const JoinCopy& copy : join_copies_to_do) {
+        Image& overlap = slot_images[copy.id];
+        if (rescaled_pair(overlap)) {
+            WriteBackForRescaled(overlap);
+        }
+    }
     // The copy from an alias into the new image, or null when the loop below skips it.
     const auto alias_copy = [&](const JoinCopy& copy) -> const AliasedImage* {
         if (!copy.is_alias) {
@@ -4841,6 +4880,28 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         image.newest_alias_tick = image.modification_tick;
         return;
     }
+    std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
+        const ImageBase& lhs_image = slot_images[lhs->id];
+        const ImageBase& rhs_image = slot_images[rhs->id];
+        return lhs_image.modification_tick < rhs_image.modification_tick;
+    });
+    // Alias copies are in guest extents, which an image the backend re-compressed at another
+    // size (IsRescaledBc) does not have. With one on either side, guest memory is made current
+    // instead: this image, then its newer aliases oldest first, write back what the GPU wrote,
+    // and this image is uploaded again from it.
+    if (std::ranges::any_of(aliased_images, [&](const AliasedImage* aliased) {
+            return IsRescaledPair(image, slot_images[aliased->id]);
+        })) {
+        WriteBackForRescaled(image);
+        for (const AliasedImage* const aliased : aliased_images) {
+            WriteBackForRescaled(slot_images[aliased->id]);
+        }
+        SetModificationTick(slot_images, image, most_recent_tick);
+        image.newest_alias_tick = most_recent_tick;
+        image.flags |= ImageFlagBits::CpuModified;
+        RefreshContents(image, image_id);
+        return;
+    }
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
@@ -4854,11 +4915,6 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }
-    std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
-        const ImageBase& lhs_image = slot_images[lhs->id];
-        const ImageBase& rhs_image = slot_images[rhs->id];
-        return lhs_image.modification_tick < rhs_image.modification_tick;
-    });
     const auto& resolution = Settings::values.resolution_info;
     for (const AliasedImage* const aliased : aliased_images) {
         if (!resolution.active || !any_rescaled) {
