@@ -303,6 +303,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // 8 GB cards next to everything else. Normalized coordinates sample them the same; texel
 // fetches and textureSize see the host size. EDEN_NX2_UNEVEN_BC_RESCALE_MIB=N: only images
 // whose RGBA8 copy takes N MiB or more (default 256).
+// Not for an image JoinImages keeps at its guest size (keep_guest_size): it stays RGBA8.
 [[nodiscard]] bool RescalesUnevenBc(const ImageInfo& info) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE");
@@ -312,7 +313,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         const char* const value = std::getenv("EDEN_NX2_UNEVEN_BC_RESCALE_MIB");
         return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ULL) << 20;
     }();
-    if (!enabled || !g_uneven_bc_tail_trim.load(std::memory_order_relaxed) ||
+    if (!enabled || info.keep_guest_size ||
+        !g_uneven_bc_tail_trim.load(std::memory_order_relaxed) ||
         !IsPixelFormatASTC(info.format) || info.type != ImageType::e2D || info.size.depth != 1 ||
         info.num_samples != 1 || info.resources.levels <= 1 || info.size.width < 256 ||
         info.size.height < 256 ||
