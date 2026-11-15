@@ -22,7 +22,7 @@ the old way there.
 | Demoted fragments stop writing where the guest's control flow says | Moving demotes to the end of the program over nested returns let helper lanes keep writing; AMD drew a black scene | Nested returns are counted before demotes move | [#127] |
 | Fragment subgroup shuffles | AMD's proprietary driver gets them wrong | Broadcast fallback on that driver | [#273] |
 | Depth-compare samples | Undefined on colour or integer images; AMD returned green | Depth-compare images stay floating point. Binding the null image for depth-compare samples of uncomparable images is proposed in the open PR | [#273]; [#354] (open) |
-| Native FP16 arithmetic | Turned off on AMD as a driver workaround | Turned off, with no override yet. An `EDEN_AMD_FP16=1` switch to keep it for testing is proposed in the open PR | [#378] (open) |
+| Native FP16 arithmetic | Turned off on AMD as a driver workaround | Turned off on every AMD driver. An `EDEN_AMD_FP16=1` test switch was closed unmerged; keeping FP16 needs a driver-version policy backed by DKCR and Ocarina of Time evidence | [#378] (closed) |
 | ASTC is decoded by the GPU at any size | ASTC re-compressed to BC1/BC3: AMD's driver zeroes the partial edge block of small levels, whether written by copy or through a block-texel view. On an RX 6800 XT (driver 32.0.21045.5002) Ocarina's 1365x1365x90 ASTC 8x8 terrain arrays lost their last block column and row from level 4 (85x85) on (read back after `vkCmdCopyBufferToImage`: the encoder wrote the partial block, the image held zeros), and Hyrule Field's ground drew a black grid | ASTC with uneven block mips stays the GPU decoder's RGBA8 on AMD | [#679] |
 
 Not specific to AMD, but easy to mistake for an AMD bug:
@@ -48,9 +48,9 @@ Check these before filing a new one.
 
 ## Settings for AMD users
 
-- Keep the split GPU thread on (`EDEN_NX2_SPLIT=2`, the default in `nx2_switches.txt`) and GPU
-  accuracy below High, which turns the split off. Textures flickering in that setup on an RX 9070
-  XT ([#163]) were fixed by [#425].
+- Keep the split GPU thread on (`EDEN_NX2_SPLIT=2`, the default in `nx2_switches.txt`). It runs
+  at every GPU accuracy (High turned it off before #1765). Textures flickering with the split on an
+  RX 9070 XT ([#163]) were fixed by [#425].
 - Logging at `*:Info` costs CPU time in busy scenes. Use `*:Error` when you compare frame rates
   ([#403]).
 - The first run compiles every shader and can stall for minutes; later runs load the pipeline

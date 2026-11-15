@@ -386,6 +386,13 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
+    // RGBA8 is 4-16x the BC size: Ocarina of Time's uneven ASTC 8x8 images took ~3.4 GB instead
+    // of ~0.6 GB at area loads on a Steam Deck, where VRAM and system RAM are the same memory and
+    // the load peaks got the emulator killed. Integrated GPUs and cards under 6 GiB keep BC.
+    using namespace Common::Literals;
+    if (device.IsIntegrated() || device.GetDeviceLocalHeapSize() < 6_GiB) {
+        return false;
+    }
     // Uneven chains that UnevenBcTailLevels can cut short stay BC with fewer levels instead.
     return HasUnevenBlockMips(info) && UnevenBcTailLevels(info) == 0 &&
            !IsHugeAstcArray(device, info);
@@ -531,6 +538,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     }
     return HugeAstcHostFormat(device, info);
 }
+
+// Finished decode images wait for the next texture of their shape, up to this much memory.
+constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
 
 // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
 // decode, so streamed textures are ready the frame they are first used instead of seconds later.
@@ -710,6 +720,19 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         if (device.IsKhrImageFormatListSupported()) {
             image_ci.pNext = &image_format_list;
         }
+    }
+    VkImageCompressionControlEXT compression_control{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+        .pNext = image_ci.pNext,
+        .flags = VK_IMAGE_COMPRESSION_DISABLED_EXT,
+        .compressionControlPlaneCount = 0,
+        .pFixedRateFlags = nullptr,
+    };
+    // Depth keeps its compression: disabling it would also drop HTILE (HiZ).
+    if (device.DisablesColorCompression() &&
+        VideoCore::Surface::GetFormatType(info.format) ==
+            VideoCore::Surface::SurfaceType::ColorTexture) {
+        image_ci.pNext = &compression_control;
     }
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
@@ -2010,13 +2033,14 @@ bool TextureCacheRuntime::UsesNvidiaDlss() const {
 }
 
 std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
-    ImageView& input, ImageView& output) {
+    ImageView& input, ImageView& output, std::optional<std::array<u32, 2>> input_region) {
     if (!dlss_network_probe) {
         dlss_network_probe = std::make_unique<DlssNetworkProbe>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
     }
     return dlss_network_probe->Probe(input.Handle(Shader::TextureType::Color2D),
-                                     output.Handle(Shader::TextureType::Color2D));
+                                     output.Handle(Shader::TextureType::Color2D),
+                                     input_region.value_or(std::array<u32, 2>{}));
 }
 
 bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -3042,6 +3066,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
 
+u64 TextureCacheRuntime::GetDeviceHeapMemoryBudget() const {
+    return device.GetDeviceHeapMemoryBudget();
+}
+
 u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
@@ -3147,8 +3175,6 @@ void TextureCacheRuntime::TickFrame() {
         transcode_creates = transcode_reuses = 0;
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     const auto decode_bytes = [](const PendingTranscode& t) {
         u64 bytes{};
         for (u32 level = 0; level < t.levels; ++level) {
@@ -4935,7 +4961,15 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
 
     f32 min_lod = 0.0f;
     f32 max_lod = 0.25f;
-    if (tsc.mipmap_filter != TextureMipmapFilter::None) {
+    // The Duskbloods: a sampler without mipmap filtering still reads the level an explicit LOD
+    // selects, as on the console. Its bloom blurs level 1 of its mip chain with
+    // textureLod(..., 1.0) through such a sampler; clamped to level 0 it read a level nothing
+    // wrote (zeros, or stale NaNs that spread into black and purple blocks). Its LOD clamps then
+    // apply with nearest level selection, to implicit LODs too.
+    constexpr u64 DuskbloodsNetworkTestProgramId = 0x0400D1D02399A000ULL;
+    const bool mip_none_lods = tsc.mipmap_filter == TextureMipmapFilter::None &&
+                               Settings::GetCurrentProgramID() == DuskbloodsNetworkTestProgramId;
+    if (tsc.mipmap_filter != TextureMipmapFilter::None || mip_none_lods) {
         min_lod = tsc.MinLod();
         max_lod = tsc.MaxLod();
         // EDEN_NX2_FORCE_LOD0: sample only the top mip level (debug aid for mip layout problems).
@@ -4953,6 +4987,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
         added_lod_bias = biased - lod_bias;
         lod_bias = biased;
+    }
+    if (!device.SupportsSamplerMipLodBias()) {
+        lod_bias = 0.0f;
+        added_lod_bias = 0.0f;
     }
     base_ci = VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,

@@ -196,6 +196,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 spill_quiet_frames{};     ///< Frames since the last spill
     u64 spill_collect_tick{};     ///< frame_tick of the first forced collect of this episode + 1
     u32 spill_forced_collects{};  ///< Forced collects in this episode
+    u64 spill_last_collect{};     ///< frame_tick of the last forced collect
     u64 spill_log_bytes{};        ///< Spilled since the last spill log line
     u32 spill_log_collects{};     ///< Forced collects since the last spill log line
     std::chrono::steady_clock::time_point spill_log_time{};
@@ -323,6 +324,10 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// Whether the handle words and descriptors `memo` was built from still match guest memory.
+    [[nodiscard]] bool TextureMemoStillHolds(const SampledTextureMemo& memo,
+                                             std::span<const GPUVAddr> handle_addresses) const;
+
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
     /// handle_addresses are where the draw reads its texture handles from, in binding order.
@@ -432,7 +437,8 @@ public:
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src);
+        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt);
 
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
@@ -671,6 +677,8 @@ private:
     /// none for an unbacked image (too large to back, or over unwritten sparse blocks), what is
     /// bound to its layers for a SparseLayers one.
     u64 ImageMemoryBytes(const Image& image) const;
+    /// The image's allocation size where the runtime reports one, else ImageMemoryBytes.
+    u64 ImageAllocationBytes(const Image& image) const;
 
     void QueueAsyncDecode(Image& image, ImageId image_id);
     void TickAsyncDecode();

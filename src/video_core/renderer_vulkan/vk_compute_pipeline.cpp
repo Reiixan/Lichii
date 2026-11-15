@@ -212,12 +212,14 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
                                  vk::ShaderModule spv_module_, u64 shader_hash_,
-                                 std::function<vk::ShaderModule()> emit)
+                                 std::vector<u8> kept_spirv_,
+                                 std::function<vk::ShaderModule(std::vector<u8>&)> emit)
     : device{device_},
       pipeline_cache(pipeline_cache_), binaries{binaries_}, binary_key{binary_key_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)),
+      kept_spirv(std::move(kept_spirv_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
         build_notify = shader_notify;
@@ -263,10 +265,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
         // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        // A shader that lost a conditional barrier relies on a whole warp running in step: at a
-        // smaller subgroup size it reads stale shared memory, which shows as banding over the image
-        // in Mario Kart World on Intel's Windows driver.
-        const bool uses_warp_ops = info.removed_conditional_barrier ||
+        // A shader whose divergent barrier lost its execution barrier relies on a whole warp
+        // running in step: at a smaller subgroup size it reads stale shared memory, which shows as
+        // banding over the image in Mario Kart World on Intel's Windows driver.
+        const bool uses_warp_ops = info.demoted_conditional_barrier ||
                                    info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd ||
@@ -377,7 +379,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                     }
                 };
                 try {
-                    spv_module = emit();
+                    spv_module = emit(kept_spirv);
                 } catch (const std::exception& exception) {
                     fail(exception.what());
                     return {};
