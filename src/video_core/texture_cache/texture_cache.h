@@ -4499,6 +4499,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+        // What the GPU wrote to an overlap reaches the new image only by copies in guest extents,
+        // which an image re-compressed at another size (IsRescaledBc) does not have: keep the new
+        // image at its guest size then.
+        new_info.keep_guest_size =
+            std::ranges::any_of(join_copies_to_do, [this](const JoinCopy& copy) {
+                return True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+            });
+    }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     slot_images[new_image_id].load_tick = modification_tick;
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
@@ -4571,8 +4580,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         return lhs_image.modification_tick < rhs_image.modification_tick;
     });
 
+    // Copies between the new image and an overlap are made from guest extents. An image the
+    // backend re-compressed at another size (IsRescaledBc) does not have those: no copy is made
+    // to or from one, and the new image gets its contents from guest memory instead.
+    const auto rescaled_pair = [&](const Image& overlap) {
+        if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+            return overlap.IsRescaledBc() || new_image.IsRescaledBc();
+        } else {
+            return false;
+        }
+    };
     ImageBase& new_image_base = new_image;
+    // Nor are such images aliased: SynchronizeAliases would copy between them in guest extents.
+    // They only overlap, and each takes what it holds from guest memory.
     for (const ImageId aliased_id : join_right_aliased_ids) {
+        if (rescaled_pair(slot_images[aliased_id])) {
+            join_bad_overlap_ids.push_back(aliased_id);
+            continue;
+        }
         ImageBase& aliased = slot_images[aliased_id];
         size_t alias_index = new_image_base.aliased_images.size();
         if (!AddImageAlias(new_image_base, aliased, new_image_id, aliased_id)) {
@@ -4582,6 +4607,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         new_image.flags |= ImageFlagBits::Alias;
     }
     for (const ImageId aliased_id : join_left_aliased_ids) {
+        if (rescaled_pair(slot_images[aliased_id])) {
+            join_bad_overlap_ids.push_back(aliased_id);
+            continue;
+        }
         ImageBase& aliased = slot_images[aliased_id];
         size_t alias_index = new_image_base.aliased_images.size();
         if (!AddImageAlias(aliased, new_image_base, aliased_id, new_image_id)) {
@@ -4604,16 +4633,6 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
-    // Copies between the new image and an overlap are made from guest extents. An image the
-    // backend re-compressed at another size (IsRescaledBc) does not have those: no copy is made
-    // to or from one, and the new image gets its contents from guest memory instead.
-    const auto rescaled_pair = [&](const Image& overlap) {
-        if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
-            return overlap.IsRescaledBc() || new_image.IsRescaledBc();
-        } else {
-            return false;
-        }
-    };
     // The copy from an alias into the new image, or null when the loop below skips it.
     const auto alias_copy = [&](const JoinCopy& copy) -> const AliasedImage* {
         if (!copy.is_alias) {
@@ -4695,6 +4714,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (size_t index = 0; index < join_copies_to_do.size(); ++index) {
         const JoinCopy& copy_object = join_copies_to_do[index];
         Image& overlap = slot_images[copy_object.id];
+        if (True(overlap.flags & ImageFlagBits::GpuModified) && rescaled_pair(overlap)) {
+            // Only when the overlap itself is re-compressed at another size (a GPU-written overlap
+            // keeps the new image at its guest size): it can't be copied or downloaded either.
+            static u32 logged{};
+            if (logged++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "GPU-written image at {:#x} is re-compressed at another size; the "
+                            "image joined over it at {:#x} gets guest memory instead",
+                            overlap.gpu_addr, new_image.gpu_addr);
+            }
+        }
         if (copy_object.is_alias) {
             const AliasedImage* const aliased =
                 index >= first_copy ? alias_copy(copy_object) : nullptr;

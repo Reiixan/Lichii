@@ -258,8 +258,10 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // ~860 MiB of RGBA8 each, so they fit in 8 GB cards next to everything else. The decode keeps
 // the guest size and the BC encoder resamples each level to the host size. Normalized
 // coordinates sample them the same; texel fetches and textureSize see the host size.
+// Not for an image JoinImages keeps at its guest size (keep_guest_size): it stays RGBA8.
 [[nodiscard]] bool RescalesUnevenBc(const ImageInfo& info) {
-    if (!g_rescale_uneven_bc.load(std::memory_order_relaxed) || !IsPixelFormatASTC(info.format) ||
+    if (!g_rescale_uneven_bc.load(std::memory_order_relaxed) || info.keep_guest_size ||
+        !IsPixelFormatASTC(info.format) ||
         info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples != 1 ||
         info.resources.levels <= 1 || info.size.width < 256 || info.size.height < 256 ||
         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
