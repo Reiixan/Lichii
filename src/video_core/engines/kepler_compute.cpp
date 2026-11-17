@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/program_override.h"
@@ -28,6 +29,8 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -82,7 +85,11 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     }
 }
 
-KeplerCompute::~KeplerCompute() = default;
+KeplerCompute::~KeplerCompute() {
+    if (native_data_ram != nullptr) {
+        Nx2ListIndirect::ForgetChannel(native_data_ram);
+    }
+}
 
 void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -311,6 +318,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         }
         rasterizer->AccelerateInlineToMemory(address, 256,
             std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            // The slots the grid's list word placeholders name stay for its launches.
+            rasterizer->Nx2NoteInlineQmdGrid(*device, native_registers[0xc8 + 12],
+                                             native_registers[0xc8 + 13],
+                                             native_registers[0xc8 + 14]);
+        }
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
             native_registers[0xad] = static_cast<u32>(address >> 8);
@@ -518,6 +531,12 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                         .exec_address = upload_state.ExecTargetAddress(),
                         .copy_size = upload_state.GetUploadSize(),
                         .was_dirty = upload_dirty};
+        // Only the register launch below reads and clears this list. Native (QMD) launches never
+        // do, so in Ocarina it grew by one entry per upload for the whole session (768 MiB after
+        // ~90 minutes). A launch only looks at uploads since the previous one: keep the newest.
+        if (uploads.size() >= MaxPendingUploads) {
+            uploads.erase(uploads.begin(), uploads.begin() + MaxPendingUploads / 2);
+        }
         uploads.push_back(info);
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;
@@ -573,7 +592,40 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 
 /// Set up the compute registers from the native descriptor and submit the dispatch.
 /// Returns true if the dispatch was submitted, skipped, or replaced.
-bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
+bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor) {
+    // A native launch consumes the uploads made for it (the register launch does the same).
+    uploads.clear();
+    // A grid of GPU-written list words (Nx2ListIndirect): one slot's three words, which the host
+    // GPU dispatches from, or placeholders of several, whose words the back reads.
+    NativeQmdScheduler::Descriptor resolved;
+    const bool listed = Nx2ListIndirect::IsPlaceholder(descriptor[12]) ||
+                        Nx2ListIndirect::IsPlaceholder(descriptor[13]) ||
+                        Nx2ListIndirect::IsPlaceholder(descriptor[14]);
+    if (listed) {
+        indirect_list_slot =
+            Nx2ListIndirect::GridSlot(descriptor[12], descriptor[13], descriptor[14]);
+        if (!indirect_list_slot) {
+            resolved = descriptor;
+            for (const u32 word : {12U, 13U, 14U}) {
+                if (Nx2ListIndirect::IsPlaceholder(resolved[word])) {
+                    const u32 slot = Nx2ListIndirect::PlaceholderSlot(resolved[word]);
+                    std::array<u32, Nx2ListIndirect::SlotWords> words{};
+                    rasterizer->Nx2ReadListSlots(std::span<const u32>{&slot, 1}, words);
+                    Nx2ListIndirect::Stats::Count(Nx2ListIndirect::Stats::Get().grids_read);
+                    resolved[word] = words[Nx2ListIndirect::PlaceholderWord(resolved[word])];
+                }
+            }
+            // An empty grid dispatches nothing (NativeQmdScheduler::Signal does not call this).
+            if (!(resolved[12] && (resolved[13] & 0xffff) && (resolved[14] & 0xffff))) {
+                return true;
+            }
+        }
+    }
+    SCOPE_EXIT {
+        indirect_list_slot.reset();
+    };
+    const NativeQmdScheduler::Descriptor& qmd =
+        listed && !indirect_list_slot ? resolved : descriptor;
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -858,8 +910,12 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return DlssNetworkDroppedForGood() && !passes->IsPrepass(native_key) &&
-           dlss_chain.programs.contains(native_key);
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -1499,8 +1555,8 @@ bool KeplerCompute::BypassOotBaseNetwork() {
     return false;
 }
 
-/// Replace a known output pass with the latest tonemap, using scaling for the base game.
-/// The update's prepass and network may be skipped after a successful replacement.
+/// Replace a known output pass with a copy of the latest tonemapped image, using scaling for the
+/// base game. The update's network passes may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1510,42 +1566,95 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!bypass) {
         return false;
     }
-    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
-    // first frame) the network runs as usual. Its first passes are skipped only while the output
-    // pass is being replaced, so a failed replacement brings the whole network back next frame.
-    Maxwell3D::Regs::RenderTargetConfig tonemapped;
-    {
-        std::scoped_lock lock{bypass->mutex};
-        tonemapped = bypass->tonemapped;
+    // The first passes are skipped only while the output pass is being replaced, so a failed
+    // replacement brings the whole network back next frame. The game can also finish a frame with
+    // an output program this does not replace (#1688), which would read the skipped network's
+    // stale result every frame: a skip that no replacement followed brings the network back too.
+    if (native_key == PrepassProgramKey) {
+        if (bypass->output_pending.exchange(false, std::memory_order_relaxed) &&
+            bypass->output_replaced.exchange(false, std::memory_order_relaxed)) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_INFO(HW_GPU,
+                         "Ocarina of Time: the network's output pass was not replaced; running "
+                         "the network (first program after it: {:016x})",
+                         bypass->after_network.load(std::memory_order_relaxed));
+            }
+        }
+        const bool skip = bypass->output_replaced.load(std::memory_order_relaxed);
+        bypass->output_pending.store(skip, std::memory_order_relaxed);
+        return skip;
     }
-    if (tonemapped.Address() == 0) {
-        return false;
+    if (ShouldSkipUnusedDispatch(native_key,
+                                 bypass->output_replaced.load(std::memory_order_relaxed),
+                                 bypass->output_pending.load(std::memory_order_relaxed))) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Skipping unused AA dispatch {:016x} after output replacement",
+                     native_key);
+        }
+        return true;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+    if (native_key == NetworkProgramKey) {
+        bypass->after_network.store(0, std::memory_order_relaxed);
         return bypass->output_replaced.load(std::memory_order_relaxed);
     }
     const bool base_output = std::ranges::find(BaseOutputPrograms, native_key,
                                               &BaseOutputProgram::key) != BaseOutputPrograms.end();
     if (native_key != OutputProgramKey && !base_output) {
+        u64 none = 0;
+        bypass->after_network.compare_exchange_strong(none, native_key, std::memory_order_relaxed);
         return false;
     }
-    // The base game can run its tonemap at a lower resolution than the output.
+    // The update's output pass samples the HDR scene the tonemap pass reads (B10G11R11 memory
+    // through an E5B9G9R9 descriptor, see TryOcarinaUpscale), so copying it would skip the
+    // tonemap. The copy reads the latest draw of the input's size since the last output pass
+    // instead: that is the tonemap, drawn after the scene, whichever shader draws it.
+    const auto input = ConstBuffer0Image(InputImageHandleOffset);
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
-    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
-        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
-        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
-        tonemapped.tile_mode.is_pitch_linear || tonemapped.width == 0 || tonemapped.height == 0 ||
+    const auto valid = [](const std::optional<Texture::TICEntry>& image) {
+        return image && image->Address() != 0 && image->IsBlockLinear() && image->Width() != 0 &&
+               image->Height() != 0;
+    };
+    Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+    {
+        std::scoped_lock lock{bypass->mutex};
+        if (bypass->latest_address.exchange(0, std::memory_order_relaxed) != 0) {
+            tonemapped = bypass->latest_draw;
+        }
+    }
+    const Texture::TextureFormat input_format =
+        input ? input->format.Value() : Texture::TextureFormat{};
+    const bool images_valid = valid(input) && valid(output) &&
+                              (input_format == Texture::TextureFormat::B10G11R11 ||
+                               input_format == Texture::TextureFormat::E5B9G9R9) &&
+                              output->format == Texture::TextureFormat::B10G11R11;
+    // Draws are matched against the previous output pass's images, so the first one only learns
+    // them.
+    const bool learned = bypass->input_width.load(std::memory_order_relaxed) != 0;
+    if (images_valid) {
+        bypass->input_width.store(input->Width(), std::memory_order_relaxed);
+        bypass->input_height.store(input->Height(), std::memory_order_relaxed);
+        bypass->output_address.store(output->Address(), std::memory_order_relaxed);
+    }
+    // The base game can run its tonemap at a lower resolution than the output.
+    if (!images_valid || tonemapped.Address() == 0 || tonemapped.Address() == output->Address() ||
         (base_output ? tonemapped.width > output->Width() || tonemapped.height > output->Height()
-                     : tonemapped.width != output->Width() || tonemapped.height != output->Height())) {
+                     : tonemapped.width != output->Width() ||
+                           tonemapped.height != output->Height())) {
         bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
-        if (!std::exchange(warned, true)) {
+        if ((learned || !images_valid) && !std::exchange(warned, true)) {
+            const auto size = [](const std::optional<Texture::TICEntry>& image) {
+                return image ? fmt::format("{}x{} format {:#x}", image->Width(), image->Height(),
+                                           static_cast<u32>(image->format.Value()))
+                             : std::string{"unreadable"};
+            };
             LOG_WARNING(HW_GPU,
-                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}x{}, "
-                        "output {})",
-                        tonemapped.width, tonemapped.height,
-                        output ? fmt::format("{}x{}", output->Width(), output->Height())
-                               : std::string{"unreadable"});
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped "
+                        "{:#x} {}x{}, input {}, output {})",
+                        tonemapped.Address(), tonemapped.width, tonemapped.height, size(input),
+                        size(output));
         }
         return false;
     }
@@ -1585,13 +1694,15 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
     bypass->output_replaced.store(copied, std::memory_order_relaxed);
+    bypass->output_pending.store(false, std::memory_order_relaxed);
     static bool logged = false;
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
                  "Ocarina of Time: anti-aliasing network bypassed ({}): "
-                 "shader {:016x}, {:#x} {}x{} -> {:#x} {}x{}",
+                 "shader {:016x}, {:#x} {}x{} (input {:#x}) -> {:#x} {}x{}",
                  copied ? "copy of the tonemapped image" : "copy failed", native_key,
-                 tonemapped.Address(), source.width, source.height, output->Address(), width, height);
+                 tonemapped.Address(), source.width, source.height, input->Address(),
+                 output->Address(), width, height);
     }
     return copied;
 }
@@ -1846,22 +1957,23 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
 
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
+    // Temporal by default: a spatial upscale of the jittered input crawls from frame to frame.
+    // EDEN_NX2_DLSS_REPLACEMENT=spatial keeps the spatial de-jitter for comparisons.
+    static const bool spatial_requested = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
+        return option && std::string_view{option} == "spatial";
     }();
-    const bool use_history = allow_history && requested_history;
     const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
     const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
+    if (!dlss_chain.render_region && !jitter) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
-            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+            LOG_WARNING(HW_GPU, "{} replacement lacks this frame's jitter; retaining native dispatch",
+                        game);
         }
         return false;
     }
@@ -1885,10 +1997,14 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
     }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
-        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
-        jitter->width != input->Width() || jitter->height != input->Height()) {
+        jitter->color != input->Address() || jitter->width != input->Width() ||
+        jitter->height != input->Height()) {
         return false;
     }
+    // A frame without matching motion vectors and depth is scaled spatially, as is one the
+    // temporal upscale turns down; never left to the native pass.
+    bool use_history = allow_history && !spatial_requested && motion && depth &&
+                       dlss_motion_color == input->Address();
     const auto surface = [](const Texture::TICEntry& tic, Tegra::RenderTargetFormat format) {
         Fermi2D::Surface result{};
         result.format = format;
@@ -1907,11 +2023,18 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
                                                       : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, input_format), surface(*output, output_format),
-        use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
-        use_history ? &*depth : nullptr, jitter->offset,
-        use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
+    const auto upscale = [&](bool history) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format), surface(*output, output_format),
+            history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
+            history ? &*depth : nullptr, jitter->offset,
+            history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, history);
+    };
+    bool done = upscale(use_history);
+    if (!done && use_history) {
+        use_history = false;
+        done = upscale(false);
+    }
     static std::array<u32, 2> logged{};
     if (logged[game_index]++ < 8) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
@@ -1984,6 +2107,13 @@ struct FrontQmdMemory {
     void NoteWriteAt(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size, u64 position) const {
         split.NoteWriteAt(memory, address, size, position);
     }
+    [[nodiscard]] u64 OtherWritesTarget(const VideoCommon::GpuSplit& split,
+                                        GPUVAddr address) const {
+        return split.OtherWritesTarget(memory, address);
+    }
+    void NoteSemaphoreRelease(VideoCommon::GpuSplit& split, GPUVAddr address) const {
+        split.NoteSemaphoreRelease(memory, address);
+    }
     [[nodiscard]] const void* Id() const {
         return &memory;
     }
@@ -2013,6 +2143,70 @@ struct FrontQmdMemory {
     return method < 0xe00 ? Writes::Noted : Writes::Unplaced;
 }
 
+// A compute macro call as Nx2ListIndirect::ComputeFront sees it (its Context).
+template <typename EmitFunc>
+struct ListCallContext {
+    std::span<const u32> code;
+    u64 generation;
+    u32 start;
+    std::vector<u32>& params;
+    std::span<u32> data_ram;
+    std::span<const u32> registers;
+    Nx2ListIndirect::UploadState upload;
+    VideoCommon::GpuSplit& split;
+    const MemoryManager& memory;
+    VideoCore::RasterizerInterface* rasterizer;
+    EngineInterface* engine;
+    std::array<u32, 0x1000>& front_registers;
+    std::array<u32, 0x1000>& engine_registers; ///< Set directly once the split stopped
+    const EmitFunc& emit;
+
+    [[nodiscard]] std::optional<u64> DeviceWord(u64 gpu_address) const {
+        if (!split.Ran(split.LastMappingChange())) {
+            return std::nullopt; // An unmap queued before this call may change the device word
+        }
+        const auto first = memory.GpuToCpuAddress(gpu_address);
+        const auto last = memory.GpuToCpuAddress(gpu_address + 3);
+        if (!first || !last || *last != *first + 3) {
+            return std::nullopt;
+        }
+        return u64{*first};
+    }
+    void Emit(u32 method, u32 value) const {
+        emit(method, value);
+    }
+    void SendOwed(u64 device, u32 value) const {
+        split.Defer(
+            [rasterizer_ = rasterizer, device, value] {
+                rasterizer_->Nx2NoteOwedListWord(device, value);
+            },
+            0, VideoCommon::GpuSplit::Writes::Noted);
+    }
+    void Release(u32 slot) const {
+        Nx2ListIndirect::ReleaseSlot(split, rasterizer, slot);
+    }
+    void ReadSlots(std::span<const u32> slots, std::span<u32> words) const {
+        const u64 read_start =
+            Nx2ListIndirect::Stats::Enabled() ? Nx2ListIndirect::Stats::NowNs() : 0;
+        Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
+        if (Nx2ListIndirect::Stats::Enabled()) {
+            Nx2ListIndirect::Stats::NoteRead(slots.size(),
+                                             Nx2ListIndirect::Stats::NowNs() - read_start);
+        }
+    }
+    void SetRegister(u32 method, u32 value) const {
+        front_registers[method] = value;
+        if (method == Nx2ListIndirect::UploadData) {
+            return; // The upload's data port: only macros read it back, from the front's copy
+        }
+        if (split.Active()) {
+            split.MacroWrite(engine, method, value, VideoCommon::GpuSplit::Writes::Noted);
+        } else {
+            engine_registers[method] = value;
+        }
+    }
+};
+
 } // Anonymous namespace
 
 // Split GPU thread with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2): the front
@@ -2031,6 +2225,8 @@ struct KeplerCompute::FrontState {
     Upload::WrittenRange upload_range;
     u64 upload_prior{}; ///< The last write sent over its range before it began
     u64 upload_last{};  ///< The last write sent over its range, its own methods' included
+    /// The inline upload the back runs, where a word of it lands (Nx2ListIndirect).
+    Nx2ListIndirect::UploadState upload;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -2061,6 +2257,31 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
 
 // As Maxwell3D::ReleaseFront: the split stopped, the engine runs its macros again.
 void KeplerCompute::ReleaseFront() {
+    if (list_front && native_data_ram != nullptr) {
+        // They run on the GPU-written list words themselves from now on (Nx2ListIndirect).
+        const auto no_emit = [](u32, u32) {
+            return false;
+        };
+        ListCallContext<decltype(no_emit)> context{{},
+                                                   0,
+                                                   0,
+                                                   front->parameters,
+                                                   std::span<u32>{*native_data_ram},
+                                                   front->registers,
+                                                   front->upload,
+                                                   VideoCommon::GpuSplit::Get(),
+                                                   memory_manager,
+                                                   rasterizer,
+                                                   this,
+                                                   front->registers,
+                                                   native_registers,
+                                                   no_emit};
+        auto& channel = Nx2ListIndirect::GetChannel(native_data_ram);
+        if (!channel.words.empty() || !list_front->Registers().empty()) {
+            Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop);
+        }
+        list_front->ConcretizeAll(context, channel);
+    }
     native_executing_macro = front->executing_macro;
     native_parameters = std::move(front->parameters);
     native_compute_uploaded = front->compute_uploaded;
@@ -2078,6 +2299,9 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
     }
+    Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument, [&fs](u32 reg) {
+        return fs.registers[reg];
+    });
     fs.registers[method] = argument;
     switch (method) {
     case 0x45:
@@ -2278,6 +2502,7 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     if (!reduction && !one_word) {
         // 64 bits (a timestamp follows).
         split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
+        split.NoteUnknownWrites(*device + 8, 8, landing);
     }
 }
 
@@ -2339,6 +2564,43 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     FrontQmdCheck(split);
 }
 
+bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count,
+                                       u32 slot) {
+    if (!native_mode || native_data_ram == nullptr) {
+        return false;
+    }
+    auto& fs = Front(split);
+    if (fs.executing_macro || !fs.parameters.empty()) {
+        return false; // Not a call's first parameter
+    }
+    if (!list_front) {
+        list_front = std::make_unique<Nx2ListIndirect::ComputeFront>();
+    }
+    const auto positions = FrontMacroPositions(fs);
+    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    const auto& macro = FrontMacroEngine(fs);
+    const auto no_emit = [](u32, u32) {
+        return false;
+    };
+    std::vector<u32> no_params;
+    ListCallContext<decltype(no_emit)> context{macro.native_code,
+                                               macro.native_code_generation,
+                                               start,
+                                               no_params,
+                                               std::span<u32>{*native_data_ram},
+                                               fs.registers,
+                                               fs.upload,
+                                               split,
+                                               memory_manager,
+                                               rasterizer,
+                                               this,
+                                               fs.registers,
+                                               native_registers,
+                                               no_emit};
+    return list_front->PrepareCall(context, Nx2ListIndirect::GetChannel(native_data_ram), slot,
+                                   count);
+}
+
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
@@ -2378,6 +2640,37 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         FrontQmdCheck(split);
         return true;
     };
+    if (list_front && native_data_ram != nullptr) {
+        // GPU-written list words among the call's parameters or within its reach: a tagged run
+        // that leaves them to the back, or the words themselves first (Nx2ListIndirect).
+        ListCallContext<decltype(emit)> context{macro.native_code,
+                                                macro.native_code_generation,
+                                                start,
+                                                fs.parameters,
+                                                std::span<u32>{*native_data_ram},
+                                                fs.registers,
+                                                fs.upload,
+                                                split,
+                                                memory_manager,
+                                                rasterizer,
+                                                this,
+                                                fs.registers,
+                                                native_registers,
+                                                emit};
+        bool concretized{};
+        Nx2ListIndirect::Reason reason{};
+        if (list_front->Run(context, Nx2ListIndirect::GetChannel(native_data_ram), concretized,
+                            reason)) {
+            if (trace != nullptr) {
+                ListTrace::EndCall(*trace, true); // The words are the back's, as on the back
+            }
+            fs.parameters.clear();
+            return;
+        }
+        if (concretized) {
+            Nx2ListIndirect::Stats::NoteConcretized(reason);
+        }
+    }
 #ifdef ARCHITECTURE_x86_64
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
