@@ -235,6 +235,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
                            &evict_bad_overlaps, &release_rescaled,
                            out_of_memory](ImageId image_id, bool* out_must_download = nullptr) {
+        (void)release_rescaled; // only read where the backend has IsRescaledBc (not OpenGL)
         const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding) ||
             (evict_bad_overlaps && False(image.flags & ImageFlagBits::BadOverlap))) {
