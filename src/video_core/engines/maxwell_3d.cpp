@@ -349,25 +349,6 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
-namespace {
-
-// The occlusion query methods a delta draw may follow. Ocarina of Time resets the samples counter,
-// sets the render condition and reports around most of its draws, and each of these sent the next
-// draw to a full resolve. None of them touches what a delta draw keeps (pipeline, image views,
-// samplers, texture buffer bindings): they record query and conditional rendering commands, and
-// the counter is started again by the draw itself on both paths. The ones that end the render pass
-// (a condition resolved on the GPU) or submit still end the chain through the rasterizer's own
-// checks.
-bool IsReiFastDrawQueryMethod(u32 method) {
-    constexpr u32 render_enable = MAXWELL3D_REG_INDEX(render_enable);
-    constexpr u32 report = MAXWELL3D_REG_INDEX(report_semaphore);
-    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-           method - render_enable < sizeof(Maxwell3D::Regs::RenderEnable) / sizeof(u32) ||
-           method - report < sizeof(Maxwell3D::Regs::ReportSemaphore) / sizeof(u32);
-}
-
-} // Anonymous namespace
-
 // Whether a write to `method` leaves what a fast draw keeps from the draw before (pipeline, image
 // views, samplers, texture buffer bindings): the draw reads the register again on both paths, or
 // nothing a draw resolves from reads it.
@@ -401,10 +382,11 @@ bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
     // Neither is in what a delta draw keeps: the draw manager asks ShouldExecute for every draw,
     // every draw resumes the counters and host conditional rendering (NotifySegment,
     // CounterEnable), and a resolve that leaves the render pass ends the delta chain there.
-    // Rei keeps its wider set (all of render_enable and report_semaphore, see
-    // IsReiFastDrawQueryMethod), measured in Ocarina before upstream's narrower one.
+    // Upstream's set only: Rei's wider one (all of render_enable and report_semaphore) left a
+    // Forest Temple wall undrawn from one camera angle once build-366 came in (Ocarina's occlusion
+    // culling read a stale result), for no measured frame rate gain.
     return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
-           method == MAXWELL3D_REG_INDEX(render_enable.mode) || IsReiFastDrawQueryMethod(method);
+           method == MAXWELL3D_REG_INDEX(render_enable.mode);
 }
 
 bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
@@ -466,16 +448,9 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 // Runs what a write to `method` does besides storing the register (draws, clears, queries,
 // uploads, macros), and ends the fast draw chain unless the method cannot change a draw.
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
-        // A fence-flagged release signals a fence: never neutral for the fast draw path.
-        const bool query_method =
-            IsFastDrawQueryMethod(method) &&
-            !(method == MAXWELL3D_REG_INDEX(report_semaphore.query) &&
-              regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::Release &&
-              regs.report_semaphore.query.short_query != 0);
-        if (!query_method) {
-            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
-        }
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        !IsFastDrawQueryMethod(method)) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
