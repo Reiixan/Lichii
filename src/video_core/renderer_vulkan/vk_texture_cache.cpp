@@ -5673,9 +5673,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         if (!decode && !reused &&
             (decode_width != width || decode_height != height || decode_levels != levels)) {
             // The size class (made for reuse) is larger than the texture: a 4097x4097 level
-            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
-            decode_width = width;
-            decode_height = height;
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape,
+            // widened only as far as all `levels` need: a rescaled image has the levels of its
+            // rounded size (769x769 rounded to 1024 keeps 11, which 769 does not have).
+            const u32 chain_size = 1U << (levels - 1);
+            decode_width = (std::max)(width, width >= height ? chain_size : 1U);
+            decode_height = (std::max)(height, width >= height ? 1U : chain_size);
             decode_levels = levels;
             decode = make_decode(batch);
         }
