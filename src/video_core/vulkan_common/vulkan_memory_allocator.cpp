@@ -304,7 +304,7 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image, bool scratch) const {
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
             .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
@@ -319,6 +319,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
             .pUserData = nullptr,
             .priority = 0.f,
     };
+    if (scratch && !device.IsIntegrated()) {
+        // Within the budget alone is not enough: with the device heap over it, VMA takes the next
+        // memory type whose heap has room, host memory on a discrete GPU. A scratch image is then
+        // tried in another shape that may fit in device memory.
+        alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
 
     // An image of the same create info released before is taken from the recycler instead
     // (vk::ImageRecycler).
