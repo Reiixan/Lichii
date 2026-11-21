@@ -386,11 +386,6 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.format):
         return true;
-    case MAXWELL3D_REG_INDEX(vertex_id_base):
-        // Nothing in the renderer reads this register (the draw's base vertex comes from
-        // global_base_vertex_index), yet NVN's base vertex draws write it before and after
-        // every draw, which sent each of them to a full resolve.
-        return true;
     case 0x154: // MME memory address A and B: where a macro's memory reads go. Ocarina of
     case 0x155: // Time sets B before the macro that reads each occlusion report; no draw
                 // reads them.
