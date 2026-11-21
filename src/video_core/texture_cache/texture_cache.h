@@ -1490,6 +1490,15 @@ void TextureCache<P>::EvictDeadRenderTargets() {
             ++evict_small_kept;
             continue;
         }
+        // Dropped without a write-back: stale, and newer than what older images would write
+        // back (the collector does the same for a GPU-modified image it drops).
+        const auto NoteLostTransientTarget = [this](ImageBase& lost_image) {
+            if (OverlapWritebacksEnabled() &&
+                True(lost_image.flags & ImageFlagBits::GpuModified) && HasGuestRange(lost_image)) {
+                NoteOverlapWriteback(lost_image, true);
+            }
+            MarkStale(lost_image); // before UntrackImage (see MarkStale)
+        };
         bool saved_this = false;
         if (readback_shapes.contains(RtShapeKey(image))) {
             if (!IsDownloadable(image) || True(image.flags & ImageFlagBits::BadOverlap)) {
@@ -1507,17 +1516,29 @@ void TextureCache<P>::EvictDeadRenderTargets() {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            // Through the image's own address space (WriteBackImage, upstream 0b48a2f74d); one
-            // closed since writes nothing, and the pages go stale as for a target not saved.
-            if (WriteBackImage(image, copies, map.mapped_span)) {
+            // As the collector's write-back: through the image's own address space
+            // (WriteBackImage, upstream 0b48a2f74d), keeping newer write-backs that already
+            // landed, and noted (NoteFlushed) so older ones still queued don't land over it. An
+            // address space closed since writes nothing; the pages go stale as for a target not
+            // saved.
+            bool written = false;
+            try {
+                KeepRanges newer;
+                KeepNewerLanded(image, image.modification_tick, newer);
+                written = WriteBackImage(image, copies, map.mapped_span, newer);
+            } catch (const std::bad_alloc&) {
+                NoteHostOutOfMemory("write back", image);
+            }
+            if (written) {
+                NoteFlushed(image);
                 ++saved;
                 ++evict_saved;
                 saved_this = true;
             } else {
-                MarkStale(image); // before UntrackImage (see MarkStale)
+                NoteLostTransientTarget(image);
             }
         } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
+            NoteLostTransientTarget(image);
         }
         if (!saved_this && LosesGpuData(image)) {
             // Only a target whose GPU data is really lost can teach a read-back shape.
