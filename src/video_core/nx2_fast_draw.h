@@ -80,10 +80,6 @@ inline std::atomic<bool> g_dynamic_vertex_streams{};
     return g_enabled.load(std::memory_order_relaxed);
 }
 
-/// Whether the host binds vertex stream strides as dynamic state (set by the renderer): a
-/// stride change then leaves the pipeline as it is.
-inline std::atomic<bool> g_dynamic_strides{false};
-
 /// What a pipeline key holds of a vertex attribute format word (Maxwell3D::Regs::VertexAttribute)
 /// under dynamic vertex input, as FixedPipelineState::attribute_types: the class of its type
 /// (float, signed or unsigned integer), and nothing for a constant attribute.
