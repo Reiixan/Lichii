@@ -1880,8 +1880,15 @@ void TextureCache<P>::TickFrame() {
                         static const bool overridden =
                             std::getenv("EDEN_NX2_TC_EXPECTED_MIB") != nullptr ||
                             std::getenv("EDEN_NX2_TC_CRITICAL_MIB") != nullptr;
+                        // On a discrete card both budgets are the same driver figure read twice
+                        // in a row, and the second read was a few bytes larger now and then (RX
+                        // 6650 XT): the raise below then lifted critical from 4 to ~6 GiB for a
+                        // second and dropped it again, every second in Ocarina's market, and
+                        // each drop collected hundreds of MiB the game made again at once. A
+                        // capped share is GiBs below the heap's budget, so ask for a clear gap.
                         const u64 heap_budget = runtime.GetDeviceHeapMemoryBudget();
-                        if (heap_budget > budget) {
+                        const bool capped_share = heap_budget > budget + 256_MiB;
+                        if (capped_share) {
                             u64 image_bytes = 0;
                             for (const auto [image_id, image] : slot_images) {
                                 image_bytes += ImageAllocationBytes(*image);
@@ -1892,7 +1899,7 @@ void TextureCache<P>::TickFrame() {
                             other_memory =
                                 total_used_memory - (std::min)(total_used_memory, image_bytes);
                         }
-                        if (heap_budget > budget && !overridden) {
+                        if (capped_share && !overridden) {
                             const u64 heap_critical =
                                 heap_budget - (std::min)(reserved, heap_budget / 2);
                             const u64 gap = critical_memory - expected_memory;
