@@ -337,11 +337,15 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 }
 
 // The host shape of a RescalesUnevenBc image: rounded up to 256 texels, with the even block mips.
+// No more than the rounded size's full chain: a power-of-two size never makes a block mip uneven,
+// so a guest declaring more levels than its size has (769x769 with 12) kept them all, one past
+// what Vulkan allows for 1024x1024, and past its decode image's views.
 [[nodiscard]] ImageInfo RescaledBcInfo(const ImageInfo& info) {
     ImageInfo host = info;
     host.size.width = Common::AlignUp(info.size.width, 256U);
     host.size.height = Common::AlignUp(info.size.height, 256U);
-    host.resources.levels = static_cast<s32>(EvenBlockMipCount(host));
+    host.resources.levels = static_cast<s32>(VideoCommon::HostMipLevelCount(
+        host.size.width, host.size.height, 1, EvenBlockMipCount(host)));
     return host;
 }
 
@@ -5710,9 +5714,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const auto size_class = [](u32 size) {
         return size <= 512 ? std::bit_ceil((std::max)(size, 4U)) : Common::AlignUp(size, 512U);
     };
-    const u32 decode_width = reuse_larger ? size_class(width) : width;
-    const u32 decode_height = reuse_larger ? size_class(height) : height;
-    const u32 decode_levels =
+    // Not const: when the size class does not fit, the exact shape is tried last.
+    u32 decode_width = reuse_larger ? size_class(width) : width;
+    u32 decode_height = reuse_larger ? size_class(height) : height;
+    u32 decode_levels =
         reuse_larger ? static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height)))
                      : levels;
     u64 layer_bytes = 0;
@@ -5769,7 +5774,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         ++transcode_reuses;
     } else {
         ++transcode_creates;
-        const VkImageCreateInfo decode_ci{
+        VkImageCreateInfo decode_ci{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
@@ -5786,13 +5791,27 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
+        // Not counted as failed images: another attempt may follow, and the texture cache
+        // collects as out of memory on one (NoteFailedImage below, when none fits).
+        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true, false);
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
             free_transcodes.clear();
-            decode = memory_allocator.TryCreateImage(decode_ci, true);
+            decode = memory_allocator.TryCreateImage(decode_ci, true, false);
+        }
+        if (!decode &&
+            (decode_width != width || decode_height != height || decode_levels != levels)) {
+            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
+            decode_width = width;
+            decode_height = height;
+            decode_levels = levels;
+            decode_ci.extent = {decode_width, decode_height, 1};
+            decode_ci.mipLevels = decode_levels;
+            decode = memory_allocator.TryCreateImage(decode_ci, true, false);
         }
         if (!decode) {
+            memory_allocator.NoteFailedImage();
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,

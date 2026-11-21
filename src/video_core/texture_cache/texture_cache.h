@@ -5163,7 +5163,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     };
     ImageBase& new_image_base = new_image;
     // Nor are such images aliased: SynchronizeAliases would copy between them in guest extents.
-    // They only overlap, and each takes what it holds from guest memory.
+    // They only overlap, and each takes what it holds from guest memory. So they are not coherent
+    // with each other: a later GPU write to the other image does not reach the rescaled one,
+    // which keeps its BC contents until a guest-memory write (CpuModified) or an unmap re-makes
+    // it. Only ASTC is rescaled, which the GPU can't render into; a render target over its
+    // range means the game reused the memory, and what it wrote is not ASTC data for the old
+    // image to show (nor in guest memory, for a refresh to read).
     for (const ImageId aliased_id : join_right_aliased_ids) {
         if (rescaled_pair(slot_images[aliased_id])) {
             join_bad_overlap_ids.push_back(aliased_id);
