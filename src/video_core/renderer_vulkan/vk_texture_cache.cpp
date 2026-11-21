@@ -5796,27 +5796,36 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        // Not counted as failed images: another attempt may follow, and the texture cache
-        // collects as out of memory on one (NoteFailedImage below, when none fits).
-        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true, false);
+        // Scratch attempts stay within the memory budget and a miss counts for nothing: the
+        // size class went over budget to host memory where the exact shape still fit, and a miss
+        // another attempt recovered made the texture cache collect as out of memory.
+        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true, true);
         if (!decode && !free_transcodes.empty()) {
             // The GPU is done with these: their memory goes back to the driver now.
             free_transcodes.clear();
-            decode = memory_allocator.TryCreateImage(decode_ci, true, false);
+            decode = memory_allocator.TryCreateImage(decode_ci, true, true);
         }
-        if (!decode && (decode_width != exact_width || decode_height != exact_height ||
-                        decode_levels != levels)) {
-            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
-            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
+        const auto use_exact_shape = [&] {
             decode_width = exact_width;
             decode_height = exact_height;
             decode_levels = levels;
             decode_ci.extent = {decode_width, decode_height, 1};
             decode_ci.mipLevels = decode_levels;
-            decode = memory_allocator.TryCreateImage(decode_ci, true, false);
+        };
+        if (!decode && (decode_width != exact_width || decode_height != exact_height ||
+                        decode_levels != levels)) {
+            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
+            use_exact_shape();
+            decode = memory_allocator.TryCreateImage(decode_ci, true, true);
         }
         if (!decode) {
-            memory_allocator.NoteFailedImage();
+            // Last, the exact shape over the budget if it must (host memory), counted as a
+            // pressure event or, when even that fails, a failed image.
+            use_exact_shape();
+            decode = memory_allocator.TryCreateImage(decode_ci, true);
+        }
+        if (!decode) {
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,
