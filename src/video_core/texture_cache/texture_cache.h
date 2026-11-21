@@ -1334,7 +1334,68 @@ void TextureCache<P>::LogThresholds() const {
 }
 
 template <class P>
+u64 TextureCache<P>::GuestSizeKey(GPUVAddr gpu_addr, const ImageInfo& info) noexcept {
+    u64 key = gpu_addr;
+    key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(info.format);
+    key = key * 0x9E3779B97F4A7C15ULL ^ (u64{info.size.width} << 32 | info.size.height);
+    key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(info.resources.layers);
+    return key;
+}
+
+template <class P>
+void TextureCache<P>::NoteTexelSizeUse(const ImageViewBase& image_view) {
+    if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+        if (image_view.type == ImageViewType::Buffer || image_view.image_id == NULL_IMAGE_ID) {
+            return;
+        }
+        const Image& image = slot_images[image_view.image_id];
+        if (!image.IsRescaledBc() || std::ranges::find(guest_size_requests,
+                                                       image_view.image_id) !=
+                                         guest_size_requests.end()) {
+            return;
+        }
+        guest_size_requests.push_back(image_view.image_id);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ApplyGuestSizeRequests() {
+    if (guest_size_requests.empty()) {
+        return;
+    }
+    const auto requests = std::exchange(guest_size_requests, {});
+    for (const ImageId image_id : requests) {
+        if (!slot_images.contains(image_id)) {
+            continue;
+        }
+        Image& image = slot_images[image_id];
+        if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
+            if (!image.IsRescaledBc() || False(image.flags & ImageFlagBits::Registered)) {
+                continue;
+            }
+        }
+        // Its texels differ from the guest's: the guest data is read again into an image of
+        // the guest's size (keep_guest_size), as the RGBA8 the backend made before.
+        guest_size_shapes.insert(GuestSizeKey(image.gpu_addr, image.info));
+        static u32 logged{};
+        if (logged++ < 16) {
+            LOG_WARNING(HW_GPU,
+                        "A shader reads {}x{}x{} (format {}) in texels: made again at its guest "
+                        "size instead of the re-compressed one",
+                        image.info.size.width, image.info.size.height,
+                        image.info.resources.layers, static_cast<u32>(image.info.format));
+        }
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+    }
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
+    ApplyGuestSizeRequests();
     FinishAsyncOverlapDownloads(false);
     if (Common::DkbFrameTrace::Enabled()) {
         static u64 frames{};
@@ -4729,7 +4790,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         new_info.keep_guest_size =
             std::ranges::any_of(join_copies_to_do, [this](const JoinCopy& copy) {
                 return True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
-            });
+            }) ||
+            (!guest_size_shapes.empty() &&
+             guest_size_shapes.contains(GuestSizeKey(gpu_addr, new_info)));
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     slot_images[new_image_id].load_tick = modification_tick;
