@@ -5625,7 +5625,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         }
         return false;
     };
-    const auto make_decode = [&](u32 batch_layers) {
+    const auto make_decode = [&](u32 batch_layers, bool scratch = true) {
         const VkImageCreateInfo decode_ci{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
@@ -5643,9 +5643,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        // Not counted as a failed image: a smaller attempt may follow, and the texture cache
-        // collects as out of memory on one (NoteFailedImage below, when none fits).
-        return memory_allocator.TryCreateImage(decode_ci, true, false);
+        // Scratch attempts stay within the memory budget and a miss counts for nothing: the
+        // allocator placed the size class over budget in host memory where a smaller attempt
+        // still fit, and a miss another attempt recovered made the texture cache collect as out
+        // of memory. Only the last attempt (scratch false) may go over the budget, and counts.
+        return memory_allocator.TryCreateImage(decode_ci, true, scratch);
     };
     const u32 planned_batch = batch;
     PendingTranscode pending;
@@ -5666,24 +5668,36 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             free_transcodes.clear();
             decode = make_decode(batch);
         }
+        // The exact shape, widened only as far as all `levels` need: a rescaled image has the
+        // levels of its rounded size (769x769 rounded to 1024 keeps 11, which 769 does not have).
+        const u32 chain_size = 1U << (levels - 1);
+        const u32 exact_width = (std::max)(width, width >= height ? chain_size : 1U);
+        const u32 exact_height = (std::max)(height, width >= height ? 1U : chain_size);
+        const auto use_exact_shape = [&] {
+            decode_width = exact_width;
+            decode_height = exact_height;
+            decode_levels = levels;
+        };
+        if (!decode && !reused &&
+            (decode_width != exact_width || decode_height != exact_height ||
+             decode_levels != levels)) {
+            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. The exact shape is
+            // never larger, so it comes before fewer layers a batch.
+            use_exact_shape();
+            decode = make_decode(batch);
+        }
         while (!decode && !reused && batch > 1) {
             batch = Common::DivCeil(batch, 2U);
             decode = make_decode(batch);
         }
-        if (!decode && !reused &&
-            (decode_width != width || decode_height != height || decode_levels != levels)) {
-            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
-            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape,
-            // widened only as far as all `levels` need: a rescaled image has the levels of its
-            // rounded size (769x769 rounded to 1024 keeps 11, which 769 does not have).
-            const u32 chain_size = 1U << (levels - 1);
-            decode_width = (std::max)(width, width >= height ? chain_size : 1U);
-            decode_height = (std::max)(height, width >= height ? 1U : chain_size);
-            decode_levels = levels;
-            decode = make_decode(batch);
+        if (!decode && !reused) {
+            // Last, the exact shape over the budget if it must (host memory), counted as a
+            // pressure event or, when even that fails, a failed image.
+            use_exact_shape();
+            decode = make_decode(batch, false);
         }
         if (!decode && !reused) {
-            memory_allocator.NoteFailedImage();
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,
