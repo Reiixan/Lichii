@@ -1506,12 +1506,15 @@ void TextureCache<P>::EvictDeadRenderTargets() {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
-            ClearStaleImage(image);
-            ++saved;
-            ++evict_saved;
-            saved_this = true;
+            // Through the image's own address space (WriteBackImage, upstream 0b48a2f74d); one
+            // closed since writes nothing, and the pages go stale as for a target not saved.
+            if (WriteBackImage(image, copies, map.mapped_span)) {
+                ++saved;
+                ++evict_saved;
+                saved_this = true;
+            } else {
+                MarkStale(image); // before UntrackImage (see MarkStale)
+            }
         } else {
             MarkStale(image); // before UntrackImage (see MarkStale)
         }
