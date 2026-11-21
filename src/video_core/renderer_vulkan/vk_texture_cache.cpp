@@ -280,11 +280,15 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 }
 
 // The host shape of a RescalesUnevenBc image: rounded up to 256 texels, with the even block mips.
+// No more than the rounded size's full chain: a power-of-two size never makes a block mip uneven,
+// so a guest declaring more levels than its size has (769x769 with 12) kept them all, one past
+// what Vulkan allows for 1024x1024, and its decode image as well.
 [[nodiscard]] ImageInfo RescaledBcInfo(const ImageInfo& info) {
     ImageInfo host = info;
     host.size.width = Common::AlignUp(info.size.width, 256U);
     host.size.height = Common::AlignUp(info.size.height, 256U);
-    host.resources.levels = static_cast<s32>(EvenBlockMipCount(host));
+    host.resources.levels = static_cast<s32>(VideoCommon::HostMipLevelCount(
+        host.size.width, host.size.height, 1, EvenBlockMipCount(host)));
     return host;
 }
 
@@ -5568,9 +5572,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const auto size_class = [](u32 size) {
         return size <= 512 ? std::bit_ceil((std::max)(size, 4U)) : Common::AlignUp(size, 512U);
     };
-    const u32 decode_width = size_class(width);
-    const u32 decode_height = size_class(height);
-    const u32 decode_levels =
+    // Not const: when the size class does not fit, the exact shape is tried last.
+    u32 decode_width = size_class(width);
+    u32 decode_height = size_class(height);
+    u32 decode_levels =
         (std::max)(levels, static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height))));
     // A decode of more than 128 MiB goes a batch of layers at a time through a smaller image:
     // title 1's terrain material arrays (1365x1365x90, 11 levels) took an ~890 MiB decode image
@@ -5638,7 +5643,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        return memory_allocator.TryCreateImage(decode_ci, true);
+        // Not counted as a failed image: a smaller attempt may follow, and the texture cache
+        // collects as out of memory on one (NoteFailedImage below, when none fits).
+        return memory_allocator.TryCreateImage(decode_ci, true, false);
     };
     const u32 planned_batch = batch;
     PendingTranscode pending;
@@ -5663,7 +5670,17 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             batch = Common::DivCeil(batch, 2U);
             decode = make_decode(batch);
         }
+        if (!decode && !reused &&
+            (decode_width != width || decode_height != height || decode_levels != levels)) {
+            // The size class (made for reuse) is larger than the texture: a 4097x4097 level
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
+            decode_width = width;
+            decode_height = height;
+            decode_levels = levels;
+            decode = make_decode(batch);
+        }
         if (!decode && !reused) {
+            memory_allocator.NoteFailedImage();
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,

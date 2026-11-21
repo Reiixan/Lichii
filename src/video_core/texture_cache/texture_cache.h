@@ -214,10 +214,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
     bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
     KeepRanges keep;
     WritebackRanges::TickedRanges keep_ticks;
+    // Set for a spill collect's last pass, which the passes before it left over the usage it
+    // started at: the rescaled BC images below may go then too.
+    bool release_rescaled = false;
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
-                           &evict_bad_overlaps,
+                           &evict_bad_overlaps, &release_rescaled,
                            out_of_memory](ImageId image_id, bool* out_must_download = nullptr) {
         (void)out_of_memory; // only read where the backend has IsRescaledBc
+        (void)release_rescaled;
         const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding) ||
             (evict_bad_overlaps && False(image.flags & ImageFlagBits::BadOverlap))) {
@@ -233,9 +237,10 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
         // image could not be made, or once their GPU range was unmapped (Remapped: nothing reads
         // it again). Re-made on every return to the field, each took a 0.4-2 s stall; kept, with
         // the cache under its cap, the 2nd zone change went from 1951 ms to 364 ms. Up to 1 GiB
-        // of them in all: a title with more is collected as before.
+        // of them in all: a title with more is collected as before. Memory spilled to host
+        // memory collects them only when nothing else could go (release_rescaled).
         if constexpr (requires(const Image& img) { img.IsRescaledBc(); }) {
-            if (!out_of_memory && image.IsRescaledBc() &&
+            if (!out_of_memory && !release_rescaled && image.IsRescaledBc() &&
                 rescaled_bc_bytes <= MaxKeptRescaledBytes &&
                 False(image.flags & ImageFlagBits::Remapped)) {
                 return false;
@@ -457,7 +462,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
     if (out_of_memory || total_used_memory >= critical_memory ||
         (at_critical && total_used_memory >= usage_at_start)) {
         Configure(true);
+        release_rescaled = at_critical && total_used_memory >= usage_at_start;
         Collect();
+        release_rescaled = false;
     }
     if (!overlap_downloads.empty() && async_downloads) {
         std::stable_sort(overlap_downloads.begin(), overlap_downloads.end(),
@@ -4808,7 +4815,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     };
     ImageBase& new_image_base = new_image;
     // Nor are such images aliased: SynchronizeAliases would copy between them in guest extents.
-    // They only overlap, and each takes what it holds from guest memory.
+    // They only overlap, and each takes what it holds from guest memory. So they are not coherent
+    // with each other: a later GPU write to the other image does not reach the rescaled one,
+    // which keeps its BC contents until a guest-memory write (CpuModified) or an unmap re-makes
+    // it. Only ASTC is rescaled, which the GPU can't render into; a render target over its
+    // range means the game reused the memory, and what it wrote is not ASTC data for the old
+    // image to show (nor in guest memory, for a refresh to read).
     for (const ImageId aliased_id : join_right_aliased_ids) {
         if (rescaled_pair(slot_images[aliased_id])) {
             join_bad_overlap_ids.push_back(aliased_id);

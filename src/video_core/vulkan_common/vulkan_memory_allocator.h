@@ -110,7 +110,10 @@ namespace Vulkan {
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
         /// CreateImage, but a null image instead of an exception when there is no memory for it.
-        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// count_failure false: a scratch image the caller tries again smaller, which is not a
+        /// failed image (FailedImages) unless the caller gives up (NoteFailedImage).
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                                 bool count_failure = true) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
@@ -133,6 +136,11 @@ namespace Vulkan {
         /// texture cache collects aggressively when it grows.
         u32 FailedImages() const noexcept {
             return failed_images.load(std::memory_order_relaxed);
+        }
+
+        /// Counts an image the caller could not make after uncounted TryCreateImage attempts.
+        void NoteFailedImage() const noexcept {
+            failed_images.fetch_add(1, std::memory_order_relaxed);
         }
 
         /// Device-local bytes VMA placed in host memory (device heap over its budget) since the
@@ -178,7 +186,7 @@ namespace Vulkan {
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                               vk::Image &image) const;
+                               vk::Image &image, bool count_failure = true) const;
 
         /// CreateBuffer's fallbacks; the buffer is left null when the result is an error.
         /// min_alignment over 1 aligns the allocation and skips the separate buffer pool.

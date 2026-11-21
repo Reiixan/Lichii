@@ -225,9 +225,10 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     return image;
 }
 
-vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
+vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                          bool count_failure) const {
     vk::Image image;
-    const VkResult result = AllocateImage(ci, dedicated, true, image);
+    const VkResult result = AllocateImage(ci, dedicated, true, image, count_failure);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
@@ -235,7 +236,7 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
 }
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
-                                        vk::Image &image) const {
+                                        vk::Image &image, bool count_failure) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -306,7 +307,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     if (result != VK_SUCCESS) {
-        failed_images.fetch_add(1, std::memory_order_relaxed);
+        if (count_failure) {
+            failed_images.fetch_add(1, std::memory_order_relaxed);
+        }
         static u32 failed_logged{};
         if (failed_logged == 0) {
             // What ran out: the device's heaps or the host's commit. Before the error line,
