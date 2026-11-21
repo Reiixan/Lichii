@@ -5714,9 +5714,14 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const auto size_class = [](u32 size) {
         return size <= 512 ? std::bit_ceil((std::max)(size, 4U)) : Common::AlignUp(size, 512U);
     };
+    // The exact shape, widened only as far as all `levels` need: a rescaled image has the levels
+    // of its rounded size (769x769 rounded to 1024 keeps 11, which 769 does not have).
+    const u32 chain_size = 1U << (levels - 1);
+    const u32 exact_width = (std::max)(width, width >= height ? chain_size : 1U);
+    const u32 exact_height = (std::max)(height, width >= height ? 1U : chain_size);
     // Not const: when the size class does not fit, the exact shape is tried last.
-    u32 decode_width = reuse_larger ? size_class(width) : width;
-    u32 decode_height = reuse_larger ? size_class(height) : height;
+    u32 decode_width = reuse_larger ? size_class(width) : exact_width;
+    u32 decode_height = reuse_larger ? size_class(height) : exact_height;
     u32 decode_levels =
         reuse_larger ? static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height)))
                      : levels;
@@ -5737,7 +5742,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
     const auto fits = [&](const PendingTranscode& t) {
         if (!reuse_larger) {
-            return t.width == width && t.height == height && t.levels == levels &&
+            return t.width == exact_width && t.height == exact_height && t.levels == levels &&
                    t.layers == batch_layers;
         }
         return t.width >= width && t.height >= height && t.levels >= levels &&
@@ -5799,15 +5804,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             free_transcodes.clear();
             decode = memory_allocator.TryCreateImage(decode_ci, true, false);
         }
-        if (!decode &&
-            (decode_width != width || decode_height != height || decode_levels != levels)) {
+        if (!decode && (decode_width != exact_width || decode_height != exact_height ||
+                        decode_levels != levels)) {
             // The size class (made for reuse) is larger than the texture: a 4097x4097 level
-            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape,
-            // widened only as far as all `levels` need: a rescaled image has the levels of its
-            // rounded size (769x769 rounded to 1024 keeps 11, which 769 does not have).
-            const u32 chain_size = 1U << (levels - 1);
-            decode_width = (std::max)(width, width >= height ? chain_size : 1U);
-            decode_height = (std::max)(height, width >= height ? 1U : chain_size);
+            // decodes in a 4608x4608 full chain, ~108 MiB against ~64 MiB. Try the exact shape.
+            decode_width = exact_width;
+            decode_height = exact_height;
             decode_levels = levels;
             decode_ci.extent = {decode_width, decode_height, 1};
             decode_ci.mipLevels = decode_levels;
