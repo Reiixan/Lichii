@@ -65,9 +65,17 @@ TEST_CASE("Larger cards collect from 5 GiB or 5/8 of their budget",
     REQUIRE(VideoCommon::MaxCriticalMemory(7 * GiB, 16 * GiB) == 10 * GiB);
 }
 
-TEST_CASE("The system's commit room is reported where there is a commit limit",
+TEST_CASE("A job object's lower commit room lowers the texture cache limit",
           "[video_core][texture_cache][host_memory_limit]") {
-    const std::optional<u64> room = Common::GetSystemCommitRoom();
+    const u64 system = VideoCommon::HostCriticalMemory(6 * GiB, 20 * GiB);
+    const u64 job = VideoCommon::HostCriticalMemory(6 * GiB, 4 * GiB);
+    REQUIRE(job == 8 * GiB);
+    REQUIRE(job < system);
+}
+
+TEST_CASE("The process's commit room is reported where there is a commit limit",
+          "[video_core][texture_cache][host_memory_limit]") {
+    const std::optional<u64> room = Common::GetProcessCommitRoom();
 #ifdef _WIN32
     REQUIRE(room.has_value());
     const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
