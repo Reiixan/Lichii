@@ -122,6 +122,7 @@ public:
     /// free, and when memory runs short the recycler gives it back first.
     u64 GetRecycledImageMemory() const;
     void ShrinkRecycledImages(u64 bytes);
+    [[nodiscard]] vk::ImageRecycler::Stats GetRecyclerStats() const;
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;

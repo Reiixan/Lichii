@@ -1275,6 +1275,52 @@ void TextureCache<P>::ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_a
 }
 
 template <class P>
+bool TextureCache<P>::RecyclerOverRoom(u64 driver_usage, u64 kept) {
+    // Giving back past the critical threshold left the pool empty where it helps most: on 8 GB
+    // cards Ocarina's Market keeps the cache over critical (5.2-5.9 GiB against 5 GiB), so the
+    // pool halved every frame and kept nothing: ~2800 dedicated image allocations a run (2.8 s)
+    // and as many frees, for render targets the game makes again in the same shape. The pool
+    // only needs to stay out of the driver's budget: give back near it, with the margins the
+    // thresholds keep (1/8 of it up to 1 GiB, plus what out-of-memory events and spills added).
+    // EDEN_NX2_RECYCLE_AT_CRITICAL=1 keeps the critical threshold rule.
+    static const bool at_critical = [] {
+        const char* const value = std::getenv("EDEN_NX2_RECYCLE_AT_CRITICAL");
+        return value != nullptr && value[0] == '1';
+    }();
+    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+        if (!at_critical) {
+            if (recycler_budget_frames++ % 30 == 0) {
+                recycler_budget = runtime.GetDeviceMemoryBudget();
+            }
+            if (recycler_budget > 2_GiB) {
+                const u64 margin = (std::min)(recycler_budget / 8, 1_GiB) + pressure_margin +
+                                   spill_margin;
+                return driver_usage + margin >= recycler_budget;
+            }
+        }
+    }
+    return total_used_memory + kept >= critical_memory;
+}
+
+template <class P>
+void TextureCache<P>::LogRecyclerStats(u64 kept) {
+    if constexpr (requires { runtime.GetRecyclerStats(); }) {
+        static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+        if (!mem_trace || recycler_log_frames++ % 600 != 0) {
+            return;
+        }
+        const auto stats = runtime.GetRecyclerStats();
+        LOG_INFO(HW_GPU,
+                 "Image recycler: {} taken, {} looked for in vain, {} kept, {} MiB given back "
+                 "under memory pressure; holds {} MiB (budget {} MiB)",
+                 stats.taken, stats.missed, stats.kept, stats.shrunk_bytes >> 20, kept >> 20,
+                 recycler_budget >> 20);
+    } else {
+        (void)kept;
+    }
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
@@ -1387,6 +1433,7 @@ void TextureCache<P>::TickFrame() {
     // check below, which counts what isn't images from it.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
+        [[maybe_unused]] const u64 driver_usage = total_used_memory;
         // Images the collector deleted keep their memory for TICKS_TO_DESTROY frames: counting
         // it kept the collector in aggressive mode, deleting 40+ images a frame for frames after
         // it had freed enough (title 1: frames over 100 ms for seconds at a time).
@@ -1395,14 +1442,15 @@ void TextureCache<P>::TickFrame() {
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
         // Images the Vulkan recycler keeps are free memory to the collector: counted, a larger
-        // pool pushed it into high priority (more deletes and write-backs). With them past the
-        // critical memory, the pool gives back half of what it keeps each frame.
+        // pool pushed it into high priority (more deletes and write-backs). With the device
+        // near its budget, the pool gives back half of what it keeps each frame.
         if constexpr (requires { runtime.GetRecycledImageMemory(); }) {
             const u64 kept = runtime.GetRecycledImageMemory();
             total_used_memory -= (std::min)(total_used_memory, kept);
-            if (kept != 0 && total_used_memory + kept >= critical_memory) {
+            if (kept != 0 && RecyclerOverRoom(driver_usage, kept)) {
                 runtime.ShrinkRecycledImages(kept / 2);
             }
+            LogRecyclerStats(kept);
         }
     }
     bool spill_collect = false; ///< Memory spilled to host memory: collect hard this frame
