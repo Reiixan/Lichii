@@ -5477,19 +5477,29 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     };
     const u32 decode_width = size_class(width);
     const u32 decode_height = size_class(height);
-    const u32 decode_levels =
-        (std::max)(levels, static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height))));
     // A decode of more than 128 MiB goes a batch of layers at a time through a smaller image:
     // title 1's terrain material arrays (1365x1365x90, 11 levels) took an ~890 MiB decode image
     // each, which stalled 80-230 ms with VRAM full and once landed in host memory. On a full card
     // the whole-array allocation failed on every use of the texture (#1035), and on an integrated
     // GPU it came out of host RAM (#1756); 128 MiB stays under the free pool's 256 MiB there too.
     constexpr u64 MaxDecodeBytes = u64{128} << 20;
-    u64 decode_layer_bytes = 0;
-    for (u32 level = 0; level < decode_levels; ++level) {
-        decode_layer_bytes += u64{(std::max)(decode_width >> level, 1U)} *
-                              (std::max)(decode_height >> level, 1U) * 4;
-    }
+    const auto decode_chain_bytes = [&](u32 mip_levels) {
+        u64 bytes = 0;
+        for (u32 level = 0; level < mip_levels; ++level) {
+            bytes += u64{(std::max)(decode_width >> level, 1U)} *
+                     (std::max)(decode_height >> level, 1U) * 4;
+        }
+        return bytes;
+    };
+    // The full mip chain lets later textures with more levels reuse the image, but only when one
+    // layer of it fits the budget: batching cannot go below a layer, so an 8192x4096 single-level
+    // texture would otherwise decode through ~171 MiB instead of its exact 128 MiB.
+    const u32 capacity_levels =
+        static_cast<u32>(std::bit_width((std::max)(decode_width, decode_height)));
+    const u32 decode_levels = decode_chain_bytes(capacity_levels) <= MaxDecodeBytes
+                                  ? (std::max)(levels, capacity_levels)
+                                  : levels;
+    const u64 decode_layer_bytes = decode_chain_bytes(decode_levels);
     u32 batch = layers;
     if (decode_layer_bytes * layers > MaxDecodeBytes && info.layer_stride != 0) {
         batch = static_cast<u32>(std::clamp<u64>(MaxDecodeBytes / decode_layer_bytes, 1, layers));
