@@ -825,10 +825,10 @@ private:
                 const auto match = MatchGitHubBuild(identity, build);
                 QString version;
                 if (build.download) {
-                    const auto& download = *build.download;
-                    const QJsonArray selection{QString::fromLatin1(download.sha256.toHex()),
-                                               static_cast<int>(download.patch.kind),
-                                               download.patch.member, download.patch.tag};
+                    const auto& build_file = *build.download;
+                    const QJsonArray selection{QString::fromLatin1(build_file.sha256.toHex()),
+                                               static_cast<int>(build_file.patch.kind),
+                                               build_file.patch.member, build_file.patch.tag};
                     const auto fingerprint = QCryptographicHash::hash(
                         QJsonDocument(selection).toJson(QJsonDocument::Compact),
                         QCryptographicHash::Sha256);
