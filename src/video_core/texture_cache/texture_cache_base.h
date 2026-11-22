@@ -208,6 +208,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 spill_margin{};           ///< Extra room for it, sized to what spilled (at most 768 MiB)
     u64 spill_window_bytes{};     ///< Spilled in the current window
     u64 spill_window_start{};     ///< frame_tick the current window began at
+    u64 recycler_budget{};        ///< Driver budget RecyclerOverRoom compares with (every 30 frames)
+    u64 recycler_budget_frames{};
+    u64 recycler_log_frames{};
     u64 spill_quiet_frames{};     ///< Frames since the last spill
     u64 spill_collect_tick{};     ///< frame_tick of the first forced collect of this episode + 1
     u32 spill_forced_collects{};  ///< Forced collects in this episode
@@ -779,6 +782,11 @@ private:
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
     void LogThresholds() const;
+
+    /// Whether the Vulkan image recycler should give memory back this frame (see TickFrame).
+    [[nodiscard]] bool RecyclerOverRoom(u64 driver_usage, u64 kept);
+    /// EDEN_NX2_MEM_TRACE: the recycler's counts every 600 frames.
+    void LogRecyclerStats(u64 kept);
 
     /// A GPU-written image dropped without being written back leaves its
     /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept

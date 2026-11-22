@@ -565,6 +565,7 @@ struct RecyclerState {
     std::vector<RecycledImage> images; // oldest first
     u64 bytes = 0;
     VmaAllocator closed{}; ///< Torn down: keeps nothing more of it
+    ImageRecycler::Stats stats{};
 };
 
 RecyclerState& Recycler() {
@@ -697,6 +698,7 @@ bool ImageRecycler::Put(u64 key, VmaAllocator allocator, VkImage handle,
     TrimRecycler(state, info.size, now);
     state.images.push_back({key, allocator, handle, allocation, info.size, now});
     state.bytes += info.size;
+    ++state.stats.kept;
     return true;
 }
 
@@ -721,6 +723,7 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
             break;
         }
     }
+    ++(found ? state.stats.taken : state.stats.missed);
     TrimRecycler(state, 0, std::chrono::steady_clock::now());
     return found;
 }
@@ -739,7 +742,15 @@ void ImageRecycler::Shrink(u64 bytes) noexcept {
     }
     // Kept bytes never pass the cap, so here bytes < cap: dropping the oldest until
     // `cap - bytes` more fit leaves at most `bytes`.
+    const u64 before = state.bytes;
     TrimRecycler(state, RecyclerCap - bytes, std::chrono::steady_clock::now());
+    state.stats.shrunk_bytes += before - state.bytes;
+}
+
+ImageRecycler::Stats ImageRecycler::GetStats() noexcept {
+    RecyclerState& state = Recycler();
+    std::scoped_lock lock{state.mutex};
+    return state.stats;
 }
 
 void ImageRecycler::Open(VmaAllocator allocator) noexcept {

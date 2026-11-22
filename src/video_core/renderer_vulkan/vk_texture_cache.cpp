@@ -3234,6 +3234,10 @@ void TextureCacheRuntime::ShrinkRecycledImages(u64 bytes) {
     vk::ImageRecycler::Shrink(bytes);
 }
 
+vk::ImageRecycler::Stats TextureCacheRuntime::GetRecyclerStats() const {
+    return vk::ImageRecycler::GetStats();
+}
+
 u64 TextureCacheRuntime::CurrentTick() const noexcept {
     return scheduler.CurrentTick();
 }

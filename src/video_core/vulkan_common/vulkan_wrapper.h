@@ -801,6 +801,15 @@ public:
     [[nodiscard]] static u64 KeptBytes() noexcept;
     /// Drops the oldest kept images until at most `bytes` are kept.
     static void Shrink(u64 bytes) noexcept;
+    /// Counts since start: images taken, keyed lookups that found none, images kept, and the
+    /// bytes Shrink dropped.
+    struct Stats {
+        u64 taken;
+        u64 missed;
+        u64 kept;
+        u64 shrunk_bytes;
+    };
+    [[nodiscard]] static Stats GetStats() noexcept;
 };
 
 struct MemoryLocation {
