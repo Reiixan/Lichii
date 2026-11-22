@@ -28,6 +28,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
+#include "video_core/due_composites.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
@@ -36,6 +37,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -215,12 +217,20 @@ struct GPU::Impl {
     }
 
     /// Tick pending requests within the GPU.
+    bool HasSyncRequests() {
+        std::scoped_lock lck{sync_request_mutex};
+        return !sync_requests.empty();
+    }
+
     void TickWork() {
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            if (VideoCommon::GpuSplit::OnBackThread()) {
+                VideoCommon::GpuSplit::Get().WaitRender();
+            }
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
@@ -429,7 +439,7 @@ struct GPU::Impl {
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
              composite_fences = std::move(fences)] {
                 if (num_fences == 0) {
-                    renderer->Composite(composite_layers);
+                    CompositeOnOwner(composite_layers);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
@@ -441,7 +451,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    renderer->Composite(composite_layers);
+                    CompositeOnOwner(composite_layers);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -449,6 +459,25 @@ struct GPU::Impl {
                 }
             });
         gpu_thread.TickGPU(is_async);
+    }
+
+    /// A present whose fences were all reached, on the thread that reached the last one. Every
+    /// present goes through due_composites, so none overtakes one queued for the owner.
+    void CompositeOnOwner(const VideoCommon::DueComposites::Layers& layers) {
+        const auto composite = [this](const VideoCommon::DueComposites::Layers& due) {
+            renderer->Composite(due);
+        };
+        // A fence another thread reached waits for the owner's next tick. That thread may be one
+        // the GPU threads wait for, so it doesn't wait.
+        // A posted op playing on GPURender owns the scheduler but not the back's state the
+        // composite ticks (the back runs on): it hands the present off as any other thread.
+        due_composites.Reached(
+            layers,
+            VideoCommon::GpuSplit::OwnsScheduler() && !VideoCommon::GpuSplit::PlayingUnlent(),
+            composite, [this, composite] {
+                (void)RequestSyncOperation([this, composite] { due_composites.Run(composite); });
+                gpu_thread.TickGPU(true);
+            });
     }
 
     void WaitForComposite() {
@@ -526,6 +555,7 @@ struct GPU::Impl {
     std::deque<size_t> free_swap_counters;
     std::deque<size_t> request_swap_counters;
     std::mutex request_swap_mutex;
+    VideoCommon::DueComposites due_composites;
     u64 pending_composite_fence{};
 };
 
@@ -613,6 +643,10 @@ void GPU::WaitForSyncOperation(u64 fence) {
 
 void GPU::TickWork() {
     impl->TickWork();
+}
+
+bool GPU::HasSyncRequests() {
+    return impl->HasSyncRequests();
 }
 
 /// Gets a mutable reference to the Host1x interface

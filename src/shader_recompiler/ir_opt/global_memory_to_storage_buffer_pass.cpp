@@ -39,6 +39,15 @@ struct StorageBufferAddr {
     u32 indirect{~0U};
 };
 
+/// True when the range holds the address. Compares through a predicate: MSVC 14.51's STL sends
+/// std::ranges::find on this 12-byte type to its vectorized search, which only takes elements of
+/// 1, 2, 4 or 8 bytes and fails a static assertion.
+template <typename Range>
+bool ContainsAddr(const Range& range, const StorageBufferAddr& addr) {
+    return std::ranges::any_of(range,
+                               [&addr](const StorageBufferAddr& other) { return other == addr; });
+}
+
 /// Block iterator to a global memory instruction and the storage buffer it uses
 struct StorageInst {
     StorageBufferAddr storage_buffer;
@@ -78,6 +87,8 @@ struct NativeCandidates {
     /// instruction the search does not follow, or a table entry it left out, and can carry a
     /// pointer bound for another access.
     bool complete{};
+    /// The access block the table holder search left phi inputs out for (see AllowsPhi)
+    const IR::Block* pruned_at{};
 };
 
 /// A global access left for the backend to route among its own candidate buffers
@@ -484,25 +495,29 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
 std::optional<StorageBufferAddr> TrackAddend(const IR::Value& value) {
     std::optional<StorageBufferAddr> result;
     bool ambiguous{};
-    const auto visit{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    // Explicit stack, not recursion: a long IAdd32 chain would take one host frame per addition
+    // (the same overflow as CollectIteratorWords). Pushing Arg(1) first keeps Arg(0) first.
+    std::vector<IR::Value> pending{value};
+    while (!pending.empty() && !ambiguous) {
+        const IR::Value term{pending.back()};
+        pending.pop_back();
+        if (term.IsImmediate()) {
+            continue;
         }
         const IR::Inst* const inst{term.InstRecursive()};
         if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+            pending.push_back(inst->Arg(1));
+            pending.push_back(inst->Arg(0));
+            continue;
         }
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
             !inst->Arg(1).IsImmediate() || !Common::IsAligned(inst->Arg(1).U32(), 8)) {
-            return;
+            continue;
         }
         const StorageBufferAddr found{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
         ambiguous = result.has_value();
         result = found;
-    }};
-    visit(visit, value);
+    }
     return ambiguous ? std::nullopt : result;
 }
 
@@ -1182,12 +1197,59 @@ bool CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array.
 NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env, bool& dynamic,
-                                         StorageInfo& info) {
+                                         StorageInfo& info, const TrackingConditions& conditions) {
     NativeCandidates result;
     auto& candidates{result.pointers};
     // Whether each pointer source the search reached (a constant buffer read or a table load)
     // gave its pointers: a missing entry is one that did not.
     std::unordered_map<const IR::Inst*, bool> sources;
+    // Table loads whose pointer reaches the address from another iteration (a loop back edge) or
+    // another lane (a shuffle): the access's conditions say nothing about their table pointer.
+    std::unordered_set<const IR::Inst*> foreign_loads;
+    {
+        std::deque<std::pair<const IR::Inst*, bool>> queue{{low_addr.InstRecursive(), false}};
+        std::array<std::unordered_set<const IR::Inst*>, 2> seen;
+        while (!queue.empty()) {
+            const auto [inst, foreign] = queue.front();
+            queue.pop_front();
+            if (!seen[foreign].insert(inst).second) {
+                continue;
+            }
+            const auto follow = [&](const IR::Value& value, bool next_foreign) {
+                if (!value.IsImmediate()) {
+                    queue.emplace_back(value.InstRecursive(), next_foreign);
+                }
+            };
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::Phi:
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    follow(inst->Arg(arg), foreign || (inst->GetOpcode() == IR::Opcode::Phi &&
+                                                       conditions.IsBackEdge(inst, arg)));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                follow(inst->Arg(1), foreign);
+                follow(inst->Arg(2), foreign);
+                break;
+            case IR::Opcode::ShuffleIndex:
+                follow(inst->Arg(0), true);
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                    follow(inst->Arg(0), foreign);
+                }
+                break;
+            case IR::Opcode::LoadGlobal64:
+                if (foreign) {
+                    foreign_loads.insert(inst);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
     const auto enqueue = [&](const IR::Value& value) {
@@ -1217,7 +1279,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            !ContainsAddr(candidates, pointer) &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
@@ -1233,7 +1295,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
             const bool is_pointer{Common::IsAligned(pointer.offset, 8) &&
                                   env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)};
-            if (is_pointer && std::ranges::find(candidates, pointer) == candidates.end()) {
+            if (is_pointer && !ContainsAddr(candidates, pointer)) {
                 candidates.push_back(pointer);
             }
             sources.emplace(inst, is_pointer);
@@ -1297,7 +1359,7 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                if (ContainsAddr(candidates, pointer)) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
@@ -1312,26 +1374,33 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
                         table_complete = false;
                         return;
                     }
-                    if (std::ranges::find(info.table_candidates, pointer) ==
-                        info.table_candidates.end()) {
+                    if (!ContainsAddr(info.table_candidates, pointer)) {
                         info.table_candidates.push_back(pointer);
                     }
                 }
                 candidates.push_back(pointer);
                 dynamic = true;
             };
-            small_vector<std::pair<const IR::Inst*, bool>, 4> holders{{holder_root, false}};
-            std::unordered_set<const IR::Inst*> holder_visited{holder_root};
+            // Each holder, whether it was reached through a phi or select, and whether its value
+            // can come from another iteration or lane
+            small_vector<std::tuple<const IR::Inst*, bool, bool>, 4> holders{
+                {holder_root, false, foreign_loads.contains(inst)}};
+            std::array<std::unordered_set<const IR::Inst*>, 2> holder_visited;
+            holder_visited[std::get<2>(holders.front())].insert(holder_root);
             for (size_t pending_holder = 0; pending_holder < holders.size(); ++pending_holder) {
-                const auto [holder, via_phi] = holders[pending_holder];
-                const auto enqueue_holder = [&](const IR::Value& value, bool branch) {
-                    if (value.IsImmediate() || (holders.size() >= 8 &&
-                                                !holder_visited.contains(value.InstRecursive()))) {
+                const auto [holder, via_phi, foreign] = holders[pending_holder];
+                const auto enqueue_holder = [&](const IR::Value& value, bool branch,
+                                                bool back_edge = false) {
+                    const bool next_foreign{foreign || back_edge};
+                    if (value.IsImmediate() ||
+                        (holders.size() >= 8 &&
+                         !holder_visited[next_foreign].contains(value.InstRecursive()))) {
                         table_complete = false;
                         return;
                     }
-                    if (holder_visited.insert(value.InstRecursive()).second) {
-                        holders.emplace_back(value.InstRecursive(), via_phi || branch);
+                    if (holder_visited[next_foreign].insert(value.InstRecursive()).second) {
+                        holders.emplace_back(value.InstRecursive(), via_phi || branch,
+                                             next_foreign);
                     }
                 };
                 switch (holder->GetOpcode()) {
@@ -1342,11 +1411,28 @@ NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& e
                         table_complete = false;
                     }
                     continue;
-                case IR::Opcode::Phi:
+                case IR::Opcode::Phi: {
+                    // A predicated table pointer assignment: the input of the path that skips it
+                    // cannot reach an access under the same predicate.
+                    small_vector<size_t, 4> feasible;
                     for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
-                        enqueue_holder(holder->Arg(arg), true);
+                        if (foreign || conditions.AllowsPhi(holder, arg)) {
+                            feasible.push_back(arg);
+                        }
+                    }
+                    if (feasible.empty()) {
+                        for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
+                            feasible.push_back(arg);
+                        }
+                    } else if (feasible.size() < holder->NumArgs()) {
+                        result.pruned_at = conditions.current;
+                    }
+                    for (const size_t arg : feasible) {
+                        enqueue_holder(holder->Arg(arg), feasible.size() > 1,
+                                       conditions.IsBackEdge(holder, arg));
                     }
                     continue;
+                }
                 case IR::Opcode::SelectU32:
                     enqueue_holder(holder->Arg(1), true);
                     enqueue_holder(holder->Arg(2), true);
@@ -1489,10 +1575,17 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
+        if (it != info.native_candidates.end() && it->second.pruned_at &&
+            it->second.pruned_at != conditions.current) {
+            // Searched for an access in another block, whose conditions left other inputs out
+            info.native_candidates.erase(it);
+            it = info.native_candidates.end();
+        }
         if (it == info.native_candidates.end()) {
             bool dynamic{};
             it = info.native_candidates
-                     .emplace(start, NativePointerCandidates(low_addr, env, dynamic, info))
+                     .emplace(start,
+                              NativePointerCandidates(low_addr, env, dynamic, info, conditions))
                      .first;
             if (dynamic) {
                 info.native_dynamic.insert(start);
@@ -1523,8 +1616,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 }
             }
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find(info.table_candidates, candidate) !=
-                    info.table_candidates.end()) {
+                if (ContainsAddr(info.table_candidates, candidate)) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
                     const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
