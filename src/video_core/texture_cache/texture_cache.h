@@ -1339,7 +1339,11 @@ u64 TextureCache<P>::GuestSizeKey(GPUVAddr gpu_addr, const ImageInfo& info) noex
     u64 key = gpu_addr;
     key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(info.format);
     key = key * 0x9E3779B97F4A7C15ULL ^ (u64{info.size.width} << 32 | info.size.height);
-    key = key * 0x9E3779B97F4A7C15ULL ^ static_cast<u64>(info.resources.layers);
+    // The level count too: an image at the same address and size with other mips is another
+    // shape, and a texel-unit read of one must not keep the other at its guest size.
+    key = key * 0x9E3779B97F4A7C15ULL ^
+          (u64{static_cast<u32>(info.resources.layers)} << 32 |
+           static_cast<u32>(info.resources.levels));
     return key;
 }
 
