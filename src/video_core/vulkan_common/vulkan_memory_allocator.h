@@ -109,7 +109,7 @@ namespace Vulkan {
         /// images would otherwise leave holes in the shared blocks).
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
-        /// CreateImage, but a null image instead of an exception when there is no memory for it.
+        /// Returns a backed image, or a null image when memory is unavailable.
         /// scratch: an image the caller tries again in another shape when this one does not fit.
         /// It stays within the memory budget (no over-budget retry in host memory), and a miss
         /// is neither a memory pressure event nor a failed image: the caller makes its last
@@ -181,7 +181,7 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
+        /// may_fail: the caller handles out-of-memory errors and only accepts backed images.
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                vk::Image &image, bool scratch = false) const;
 
