@@ -568,18 +568,18 @@ std::optional<Page<T>> ParsePage(const QJsonObject& row, QLatin1StringView key, 
 
 template <typename T, typename Parse>
 auto JsonCallback(Callback<T> done, Parse parse) {
-    return [done = std::move(done), parse = std::move(parse)](auto result) {
+    return [callback = std::move(done), parse_object = std::move(parse)](auto result) {
         if (auto* error = std::get_if<Error>(&result)) {
-            done(std::move(*error));
+            callback(std::move(*error));
         } else if (const auto document = QJsonDocument::fromJson(std::get<QByteArray>(result));
                    document.isObject()) {
-            if (auto parsed = parse(document.object())) {
-                done(std::move(*parsed));
+            if (auto parsed = parse_object(document.object())) {
+                callback(std::move(*parsed));
             } else {
-                done(MakeError(ErrorCode::InvalidResponse));
+                callback(MakeError(ErrorCode::InvalidResponse));
             }
         } else {
-            done(MakeError(ErrorCode::InvalidResponse));
+            callback(MakeError(ErrorCode::InvalidResponse));
         }
     };
 }
@@ -843,11 +843,11 @@ void Request::Finish(Result result) {
     }
     auto done = std::move(transfer->done);
     transfer.reset();
-    QTimer::singleShot(0, this,
-                       [this, done = std::move(done), result = std::move(result)]() mutable {
-                           deleteLater();
-                           done(std::move(result));
-                       });
+    QTimer::singleShot(
+        0, this, [this, callback = std::move(done), completed = std::move(result)]() mutable {
+            deleteLater();
+            callback(std::move(completed));
+        });
 }
 
 void Request::ReleaseReply() {
@@ -982,15 +982,15 @@ Request* Client::GetPreview(const Mod& mod, Callback<QImage> done) {
         url = Endpoint(base_url, PreviewPath(mod.id));
     }
     return Start(
-        url, TransferKind::Preview, [done = std::move(done), gamebanana](Request::Result result) {
+        url, TransferKind::Preview, [callback = std::move(done), gamebanana](Request::Result result) {
             if (auto* error = std::get_if<Error>(&result)) {
-                done(std::move(*error));
+                callback(std::move(*error));
             } else if (QImage image =
                            DecodePreview(std::move(std::get<QByteArray>(result)), gamebanana);
                        !image.isNull()) {
-                done(std::move(image));
+                callback(std::move(image));
             } else {
-                done(MakeError(ErrorCode::InvalidImage));
+                callback(MakeError(ErrorCode::InvalidImage));
             }
         });
 }
@@ -1036,11 +1036,11 @@ Request* Client::DownloadFile(const QUrl& url, TransferKind kind, qint64 size, c
     }
     return Start(
         url, kind,
-        [done = std::move(done)](Request::Result result) {
+        [callback = std::move(done)](Request::Result result) {
             if (auto* failure = std::get_if<Error>(&result)) {
-                done(std::move(*failure));
+                callback(std::move(*failure));
             } else {
-                done(std::move(std::get<DownloadedFile>(result)));
+                callback(std::move(std::get<DownloadedFile>(result)));
             }
         },
         std::move(error), size, hash, std::move(progress));

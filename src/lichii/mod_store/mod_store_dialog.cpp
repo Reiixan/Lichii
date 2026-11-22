@@ -17,6 +17,7 @@
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDir>
+#include <QEvent>
 #include <QFutureWatcher>
 #include <QGridLayout>
 #include <QHash>
@@ -139,6 +140,28 @@ QLabel* PlainLabel(QWidget* parent, bool wrap = false) {
     return label;
 }
 
+class ModResultsTree final : public QTreeWidget {
+public:
+    using QTreeWidget::QTreeWidget;
+
+protected:
+    bool viewportEvent(QEvent* event) override {
+        switch (event->type()) {
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonDblClick:
+        case QEvent::MouseMove: {
+            const bool auto_scroll = hasAutoScroll();
+            setAutoScroll(false);
+            const bool handled = QTreeWidget::viewportEvent(event);
+            setAutoScroll(auto_scroll);
+            return handled;
+        }
+        default:
+            return QTreeWidget::viewportEvent(event);
+        }
+    }
+};
+
 class Dialog final : public QDialog {
     Q_DECLARE_TR_FUNCTIONS(ModStore::Dialog)
 
@@ -205,7 +228,7 @@ public:
         auto* middle = new QWidget(split);
         auto* middle_layout = new QVBoxLayout(middle);
         middle_layout->setContentsMargins(0, 0, 0, 0);
-        results = new QTreeWidget(middle);
+        results = new ModResultsTree(middle);
         results->setHeaderLabels({tr("Mod name"), tr("Type")});
         results->setRootIsDecorated(false);
         results->setUniformRowHeights(true);
@@ -825,10 +848,10 @@ private:
                 const auto match = MatchGitHubBuild(identity, build);
                 QString version;
                 if (build.download) {
-                    const auto& download = *build.download;
-                    const QJsonArray selection{QString::fromLatin1(download.sha256.toHex()),
-                                               static_cast<int>(download.patch.kind),
-                                               download.patch.member, download.patch.tag};
+                    const auto& build_file = *build.download;
+                    const QJsonArray selection{QString::fromLatin1(build_file.sha256.toHex()),
+                                               static_cast<int>(build_file.patch.kind),
+                                               build_file.patch.member, build_file.patch.tag};
                     const auto fingerprint = QCryptographicHash::hash(
                         QJsonDocument(selection).toJson(QJsonDocument::Compact),
                         QCryptographicHash::Sha256);
