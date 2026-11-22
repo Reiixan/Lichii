@@ -5747,6 +5747,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 host_height = rescaled ? RescaledBcInfo(info).size.height : height;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     boost::container::small_vector<u64, 16> layer_bytes; // one encoded layer of each level
+    boost::container::small_vector<u64, 16> level_offsets;
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
         const u32 level_width = (std::max)(host_width >> level, 1U);
@@ -5755,6 +5756,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         layer_bytes.push_back(u64{blocks_x} * blocks_y * block_bytes);
         const u64 size = layer_bytes.back() * layers;
+        level_offsets.push_back(total);
         copies.push_back({
             .buffer_offset = total,
             .buffer_size = size,
@@ -5776,48 +5778,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // was past the decode, and two textures' blocks met in one buffer.
     auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
 
-    const u64 layer_stride = info.layer_stride;
-    const size_t guest_size = image.guest_size_bytes;
-    for (u32 base = 0; base < layers; base += batch) {
-        const u32 count = (std::min)(batch, layers - base);
-        // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
-        // from the start of its input, so a batch is the same info with fewer layers, read from
-        // its first layer on. The swizzle math does not depend on the layer count.
-        ImageInfo batch_info = info;
-        batch_info.resources.layers = static_cast<s32>(count);
-        StagingBufferRef batch_map = map;
-        batch_map.offset += u64{base} * layer_stride;
-        const size_t guest_offset = static_cast<size_t>(u64{base} * layer_stride);
-        const size_t batch_size =
-            batch == layers
-                ? guest_size
-                : (std::min)(static_cast<size_t>(u64{count} * layer_stride),
-                             guest_size - (std::min)(guest_size, guest_offset));
-        astc_decoder_pass->AssembleInto(
-            batch_info, 0, batch_size,
-            ASTCDecoderPass::Target{
-                .image = *pending.image,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                // A later batch overwrites what the previous batch's encode read, and a reused
-                // image may still be read by an encode in flight: the barrier waits for that.
-                .initialized = reused || base != 0,
-                .level_view = [&pending](s32 level) { return *pending.views[level]; },
-                // Only the last batch submits. `map` carries this tick: a later batch reading it
-                // after a submit could find it freed, or refilled with the next upload.
-                .wait = base + count >= layers,
-                .levels = levels,
-            },
-            batch_map, swizzles);
-        for (u32 level = 0; level < levels; ++level) {
-            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                    copies[level].image_extent.height, count, bc3, output.buffer,
-                                    output.offset, total,
-                                    copies[level].buffer_offset + layer_bytes[level] * base,
-                                    (std::max)(width >> level, 1U),
-                                    (std::max)(height >> level, 1U),
-                                    IsPixelFormatSRGB(info.format));
-        }
-    }
+    // A rescaled image encodes at its host size from the decode at the guest size, and a decode
+    // image taken while in flight is still read by its last encode (initialized).
+    TranscodeAstcBatches(*astc_decoder_pass, *bc_encoder_pass, info, image.guest_size_bytes, map,
+                         swizzles, *pending.image, pending.views, batch, bc3, output.buffer,
+                         output.offset, total, level_offsets, layer_bytes, host_width, host_height,
+                         IsPixelFormatSRGB(info.format), reused);
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
