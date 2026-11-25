@@ -209,8 +209,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 spill_margin{};           ///< Extra room for it, sized to what spilled (at most 768 MiB)
     u64 spill_window_bytes{};     ///< Spilled in the current window
     u64 spill_window_start{};     ///< frame_tick the current window began at
-    u64 recycler_budget{};        ///< Driver budget RecyclerOverRoom compares with (every 30 frames)
-    u64 recycler_budget_frames{};
+    u64 budget_critical_memory{}; ///< Critical as the device budget allows it, before the cap
     u64 recycler_log_frames{};
     u64 spill_quiet_frames{};     ///< Frames since the last spill
     u64 spill_collect_tick{};     ///< frame_tick of the first forced collect of this episode + 1
@@ -792,8 +791,8 @@ private:
     void ApplyThresholdOverrides(bool log = true);
     void LogThresholds() const;
 
-    /// Whether the Vulkan image recycler should give memory back this frame (see TickFrame).
-    [[nodiscard]] bool RecyclerOverRoom(u64 driver_usage, u64 kept);
+    /// Usage past which the Vulkan image recycler gives memory back (see TickFrame).
+    [[nodiscard]] u64 RecyclerLimit() const;
     /// EDEN_NX2_MEM_TRACE: the recycler's counts every 600 frames.
     void LogRecyclerStats(u64 kept);
 
