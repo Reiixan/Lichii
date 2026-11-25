@@ -1275,31 +1275,24 @@ void TextureCache<P>::ClearStaleGpu(Tegra::MemoryManager& memory, GPUVAddr gpu_a
 }
 
 template <class P>
-bool TextureCache<P>::RecyclerOverRoom(u64 driver_usage, u64 kept) {
+u64 TextureCache<P>::RecyclerLimit() const {
     // Giving back past the critical threshold left the pool empty where it helps most: on 8 GB
-    // cards Ocarina's Market keeps the cache over critical (5.2-5.9 GiB against 5 GiB), so the
-    // pool halved every frame and kept nothing: ~2800 dedicated image allocations a run (2.8 s)
-    // and as many frees, for render targets the game makes again in the same shape. The pool
-    // only needs to stay out of the driver's budget: give back near it, with the margins the
-    // thresholds keep (1/8 of it up to 1 GiB, plus what out-of-memory events and spills added).
-    // EDEN_NX2_RECYCLE_AT_CRITICAL=1 keeps the critical threshold rule.
+    // cards critical is MaxCriticalMemory (5 GiB), Ocarina's Market keeps the cache over it
+    // (5.2-5.9 GiB), so the pool halved every frame and kept nothing: ~2800 dedicated image
+    // allocations a run (2.8 s) and as many frees, for render targets the game makes again in the
+    // same shape. That cap is about which textures are worth keeping; the pool only needs to stay
+    // out of the device's budget. So it gives back past what the budget allows the cache, the
+    // critical threshold before the cap (ApplyThresholdOverrides), with the same usage and the
+    // same reserves (block slack, out-of-memory and spill margins, host commit), refreshed with
+    // the thresholds every 30 frames. EDEN_NX2_RECYCLE_AT_CRITICAL=1 keeps the critical rule.
     static const bool at_critical = [] {
         const char* const value = std::getenv("EDEN_NX2_RECYCLE_AT_CRITICAL");
         return value != nullptr && value[0] == '1';
     }();
-    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-        if (!at_critical) {
-            if (recycler_budget_frames++ % 30 == 0) {
-                recycler_budget = runtime.GetDeviceMemoryBudget();
-            }
-            if (recycler_budget > 2_GiB) {
-                const u64 margin = (std::min)(recycler_budget / 8, 1_GiB) + pressure_margin +
-                                   spill_margin;
-                return driver_usage + margin >= recycler_budget;
-            }
-        }
-    }
-    return total_used_memory + kept >= critical_memory;
+    // Only the native thresholds follow the budget; elsewhere critical is the one figure there is.
+    return at_critical || !native_thresholds_applied
+               ? critical_memory
+               : (std::max)(budget_critical_memory, critical_memory);
 }
 
 template <class P>
@@ -1312,9 +1305,9 @@ void TextureCache<P>::LogRecyclerStats(u64 kept) {
         const auto stats = runtime.GetRecyclerStats();
         LOG_INFO(HW_GPU,
                  "Image recycler: {} taken, {} looked for in vain, {} kept, {} MiB given back "
-                 "under memory pressure; holds {} MiB (budget {} MiB)",
+                 "under memory pressure; holds {} MiB (gives back past {} MiB)",
                  stats.taken, stats.missed, stats.kept, stats.shrunk_bytes >> 20, kept >> 20,
-                 recycler_budget >> 20);
+                 RecyclerLimit() >> 20);
     } else {
         (void)kept;
     }
@@ -1330,6 +1323,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // What the device budget allows (budget minus margins), before that cap.
     const u64 budget_critical = critical_memory;
     const u64 budget_expected = expected_memory;
+    budget_critical_memory = budget_critical;
     u64 max_critical = MaxCriticalMemory;
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
         max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
@@ -1433,7 +1427,6 @@ void TextureCache<P>::TickFrame() {
     // check below, which counts what isn't images from it.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
-        [[maybe_unused]] const u64 driver_usage = total_used_memory;
         // Images the collector deleted keep their memory for TICKS_TO_DESTROY frames: counting
         // it kept the collector in aggressive mode, deleting 40+ images a frame for frames after
         // it had freed enough (title 1: frames over 100 ms for seconds at a time).
@@ -1442,12 +1435,13 @@ void TextureCache<P>::TickFrame() {
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
         // Images the Vulkan recycler keeps are free memory to the collector: counted, a larger
-        // pool pushed it into high priority (more deletes and write-backs). With the device
-        // near its budget, the pool gives back half of what it keeps each frame.
+        // pool pushed it into high priority (more deletes and write-backs). Past what the device
+        // budget allows the cache (RecyclerLimit), the pool gives back half of what it keeps
+        // each frame.
         if constexpr (requires { runtime.GetRecycledImageMemory(); }) {
             const u64 kept = runtime.GetRecycledImageMemory();
             total_used_memory -= (std::min)(total_used_memory, kept);
-            if (kept != 0 && RecyclerOverRoom(driver_usage, kept)) {
+            if (kept != 0 && total_used_memory + kept >= RecyclerLimit()) {
                 runtime.ShrinkRecycledImages(kept / 2);
             }
             LogRecyclerStats(kept);
