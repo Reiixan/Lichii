@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
+#include <cstring>
+
+#include "core/file_sys/control_metadata.h"
 #include "core/hle/service/glue/errors.h"
 #include "core/hle/service/glue/glue_manager.h"
 
@@ -45,6 +48,18 @@ Result ARPManager::GetControlProperty(std::vector<u8>* out_control_property, u64
 
     *out_control_property = iter->second.control;
     return ResultSuccess;
+}
+
+std::optional<u32> ARPManager::GetSupportedLanguages(u64 title_id) const {
+    const auto iter = entries.find(title_id);
+    if (iter == entries.end() || iter->second.control.size() != sizeof(FileSys::RawNACP)) {
+        return std::nullopt;
+    }
+    u32_le languages{};
+    std::memcpy(&languages,
+                iter->second.control.data() + offsetof(FileSys::RawNACP, supported_languages),
+                sizeof(languages));
+    return u32{languages};
 }
 
 Result ARPManager::Register(u64 title_id, ApplicationLaunchProperty launch,

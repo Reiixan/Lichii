@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -110,7 +109,7 @@ namespace Vulkan {
         /// images would otherwise leave holes in the shared blocks).
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
-        /// CreateImage, but a null image instead of an exception when there is no memory for it.
+        /// Returns a backed image, or a null image when memory is unavailable.
         vk::Image TryCreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
@@ -119,12 +118,6 @@ namespace Vulkan {
         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
 
         /// Device memory to bind to part of a sparse resource. Null when there is none left.
-        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
-        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
-                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
-                                        VmaAllocation& allocation,
-                                        VmaAllocationInfo& alloc_info) const;
-
         VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                            VkDeviceMemory &memory, VkDeviceSize &offset) const;
 
@@ -142,7 +135,17 @@ namespace Vulkan {
             return failed_images.load(std::memory_order_relaxed);
         }
 
+        /// Device-local bytes VMA placed in host memory (device heap over its budget) since the
+        /// last call, on a discrete GPU. Not a pressure event: the texture cache sizes its own
+        /// answer to how much spilled (TextureCache::TickFrame).
+        u64 TakeSpilledBytes() const noexcept {
+            return spill_pending.exchange(0, std::memory_order_relaxed);
+        }
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
+
+        /// CreateBuffer, but a null buffer instead of an exception when there is no memory for it.
+        vk::Buffer TryCreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
@@ -173,7 +176,25 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
+        /// may_fail: the caller handles out-of-memory errors and only accepts backed images.
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
+                               vk::Image &image) const;
+
+        /// CreateBuffer's fallbacks; the buffer is left null when the result is an error.
+        /// min_alignment over 1 aligns the allocation and skips the separate buffer pool.
+        VkResult AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                VkDeviceSize min_alignment, vk::Buffer &buffer) const;
+
+        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
+        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
+                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
+                                        VmaAllocation& allocation,
+                                        VmaAllocationInfo& alloc_info) const;
+
+        /// A device-local image or buffer that VMA quietly placed in host memory because the
+        /// device heap was over its budget (VMA picks another memory type instead of failing).
+        /// Adds its size to the bytes TakeSpilledBytes hands to the texture cache.
+        void NoteHostPlacement(VmaAllocation allocation, VkDeviceSize size, bool is_image) const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
@@ -182,12 +203,36 @@ namespace Vulkan {
         u32 valid_memory_types{~0u};
         mutable std::atomic<u32> pressure_events{0};
         mutable std::atomic<u32> failed_images{0};
+        /// steady_clock time (ns) of the last host placement logged after the first ones.
+        mutable std::atomic<s64> last_spill_log{0};
+        mutable std::atomic<u64> spilled_bytes{0};   ///< Since the start of the session
+        mutable std::atomic<u64> spill_pending{0};   ///< Since the last TakeSpilledBytes
+        mutable std::atomic<u32> spill_logged{0};
         mutable std::mutex buffer_type_mutex;
         /// Memory type of device-local buffers by usage and flags (CreateBufferInSeparatePool).
         mutable std::unordered_map<u64, u32> buffer_memory_types;
     };
 
+    /// create(), and once more after recover() when it threw for lack of memory.
+    template <typename Create, typename Recover>
+    auto CreateAfterRecovery(Create&& create, Recover&& recover) {
+        try {
+            return create();
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                exception.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                throw;
+            }
+            recover();
+        }
+        return create();
+    }
+
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
+
+    /// One line each for the process's memory, what DXGI counts for the GPU (Windows), and VMA's
+    /// heaps and memory types against what the driver reports (EDEN_NX2_MEM_TRACE).
+    void LogMemoryTrace(const Device& device);
 
 } // namespace Vulkan

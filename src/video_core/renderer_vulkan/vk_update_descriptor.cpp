@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -11,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "video_core/gpu_split.h"
 #include "video_core/renderer_vulkan/descriptor_payload_growth.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -33,6 +33,7 @@ UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame
 UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
 
 void UpdateDescriptorQueue::TickFrame() {
+    VideoCommon::GpuSplit::RenderOwned("UpdateDescriptorQueue::TickFrame");
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
     }
@@ -43,7 +44,9 @@ void UpdateDescriptorQueue::TickFrame() {
 /// Reserve one batch, growing drained host storage when possible, otherwise reusing it safely.
 void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entries,
                                     bool use_descriptor_buffer_) {
+    VideoCommon::GpuSplit::RenderOwned("UpdateDescriptorQueue::Acquire");
     use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+    rejected_texel_buffer = false;
     static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
     const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
     if (reserve > maximum_frame_payload_size) {

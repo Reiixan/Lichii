@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -73,13 +72,17 @@ private:
     std::array<vk::Image, MaxStaticImage> m_static_images{};
     std::array<vk::ImageView, MaxStaticImage> m_static_image_views{};
 
-    struct Images {
+    // One set of intermediate images shared by every frame in flight: each pass's layout
+    // transitions order it after earlier uses of them on the queue, and every frame rewrites them
+    // whole. Descriptor sets and framebuffers stay per frame, as Layer waits only for its own
+    // frame's work before updating them.
+    std::array<vk::Image, MaxDynamicImage> m_dynamic_images{};
+    std::array<vk::ImageView, MaxDynamicImage> m_dynamic_image_views{};
+    struct Frame {
         vk::DescriptorSets descriptor_sets{};
-        std::array<vk::Image, MaxDynamicImage> images{};
-        std::array<vk::ImageView, MaxDynamicImage> image_views{};
         std::array<vk::Framebuffer, MaxSMAAStage> framebuffers{};
     };
-    std::vector<Images> m_dynamic_images{};
+    std::vector<Frame> m_frames{};
     bool m_images_ready{};
 
     vk::Sampler m_sampler{};

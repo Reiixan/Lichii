@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -19,6 +18,7 @@
 #include "common/thread.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_address_map.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -235,6 +235,11 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetQueryPoolResults);
     X(vkGetDeviceFaultInfoEXT);
     X(vkGetPipelineExecutablePropertiesKHR);
+    X(vkGetPipelineKeyKHR);
+    X(vkCreatePipelineBinariesKHR);
+    X(vkDestroyPipelineBinaryKHR);
+    X(vkGetPipelineBinaryDataKHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
@@ -244,6 +249,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkResetFences);
     X(vkResetQueryPool);
     X(vkSetDebugUtilsObjectNameEXT);
+    X(vkSetHdrMetadataEXT);
     X(vkSetDebugUtilsObjectTagEXT);
     X(vkUnmapMemory);
     X(vkUpdateDescriptorSetWithTemplate);
@@ -255,6 +261,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBindDescriptorBuffersEXT);
     X(vkCmdSetDescriptorBufferOffsetsEXT);
     X(vkWaitForFences);
+    X(vkWaitForPresentKHR);
+    X(vkWaitForPresent2KHR);
     X(vkWaitSemaphores);
 
     // Support for timeline semaphores is mandatory in Vulkan 1.2
@@ -301,6 +309,9 @@ void SetObjectName(const DeviceDispatch* dld, VkDevice device, T handle, VkObjec
     if (dld->vkSetDebugUtilsObjectNameEXT) {
         Check(dld->vkSetDebugUtilsObjectNameEXT(device, &name_info));
     }
+    if (Vulkan::AddressMap::Wanted()) {
+        Vulkan::AddressMap::Get().Name(reinterpret_cast<u64>(handle), name);
+    }
 }
 
 } // Anonymous namespace
@@ -326,6 +337,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+    X(vkGetPhysicalDeviceSurfaceCapabilities2KHR);
     X(vkGetPhysicalDeviceSurfaceFormatsKHR);
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
@@ -337,7 +349,8 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
            X(vkEnumerateDeviceExtensionProperties) && X(vkEnumeratePhysicalDevices) &&
            X(vkGetDeviceProcAddr) && X(vkGetPhysicalDeviceFormatProperties) &&
            X(vkGetPhysicalDeviceMemoryProperties) && X(vkGetPhysicalDeviceMemoryProperties2) &&
-           X(vkGetPhysicalDeviceProperties) && X(vkGetPhysicalDeviceQueueFamilyProperties);
+           X(vkGetPhysicalDeviceProperties) && X(vkGetPhysicalDeviceQueueFamilyProperties) &&
+           X(vkGetPhysicalDeviceSparseImageFormatProperties);
 #undef X
 }
 
@@ -1277,6 +1290,20 @@ VkSurfaceCapabilitiesKHR PhysicalDevice::GetSurfaceCapabilitiesKHR(VkSurfaceKHR 
     VkSurfaceCapabilitiesKHR capabilities;
     Check(dld->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities));
     return capabilities;
+}
+
+bool PhysicalDevice::GetSurfaceCapabilities2KHR(VkSurfaceKHR surface,
+                                                VkSurfaceCapabilities2KHR& capabilities) const {
+    if (dld->vkGetPhysicalDeviceSurfaceCapabilities2KHR == nullptr) {
+        return false;
+    }
+    const VkPhysicalDeviceSurfaceInfo2KHR info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+        .pNext = nullptr,
+        .surface = surface,
+    };
+    Check(dld->vkGetPhysicalDeviceSurfaceCapabilities2KHR(physical_device, &info, &capabilities));
+    return true;
 }
 
 std::vector<VkSurfaceFormatKHR> PhysicalDevice::GetSurfaceFormatsKHR(VkSurfaceKHR surface) const {

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -774,6 +773,9 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
     }
     const auto check_through_shuffle = [](IR::Value input, IR::Value& result) {
         const IR::Value value_1{GetThroughCast(input.Resolve(), IR::Opcode::BitCastF32U32)};
+        if (value_1.IsImmediate()) {
+            return false;
+        }
         IR::Inst* const inst2{value_1.InstRecursive()};
         if (inst2->GetOpcode() == IR::Opcode::QuadBroadcast) {
             if (!inst2->Arg(1).Resolve().IsImmediate()) {
@@ -1134,7 +1136,13 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
                 throw LogicError("Undefined result in {}({}, {}, {})", IR::Opcode::BitFieldUExtract,
                                  base, shift, count);
             }
-            return (base >> shift) & ((1U << count) - 1);
+            // Shifting a 32-bit value by 32 is undefined: an empty field may start at bit 32,
+            // and a field of 32 bits needs the full mask.
+            if (count == 0) {
+                return 0U;
+            }
+            const u32 mask{count == 32 ? ~0U : (1U << count) - 1};
+            return (base >> shift) & mask;
         });
         return;
     case IR::Opcode::BitFieldSExtract:

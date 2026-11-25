@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -26,8 +25,10 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -54,6 +55,10 @@ class FenceManager {
     static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
 
 public:
+    /// EDEN_NX2_RENDER_POST_FENCE: GPURender plays a fence the back posted, whose buffer half the
+    /// back found empty: the commit leaves the back's buffer cache alone.
+    bool skip_buffer_half{};
+
     /// Notify the fence manager about a new frame
     void TickFrame() {
         std::unique_lock lock(ring_guard);
@@ -80,11 +85,20 @@ public:
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
         std::scoped_lock lock{uncommitted_guard};
         uncommitted_operations.emplace_back(std::move(func));
+        HoldUncommitted();
     }
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
+        // fence runs its operation at once, before the host GPU has run the work the report
+        // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
+        // at low GPU accuracy).
+        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
+                                 (Settings::IsGPUFenceBehaviorDefault()
+                                      ? Settings::IsGPULevelHigh()
+                                      : Settings::IsGPUFenceBehaviorBalanced() ||
+                                            Settings::IsGPUFenceBehaviorAccurate());
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -109,9 +123,17 @@ public:
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
+                HoldUncommitted();
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            pending_holds.emplace_back(std::move(uncommitted_hold));
+            if (!spare_operations.empty()) {
+                uncommitted_operations = std::move(spare_operations.back());
+                spare_operations.pop_back();
+            } else {
+                uncommitted_operations = OperationList{}; // moved-from: make it empty explicitly
+                uncommitted_operations.reserve(64);
+            }
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -123,8 +145,13 @@ public:
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
+            // The fencing thread waits for the host GPU while it has fences: it needs waking (a
+            // system call) only when it waits for fences to be made.
+            const bool wake = fence_thread_waiting;
             guard.unlock();
-            cv.notify_all();
+            if (wake) {
+                cv.notify_all();
+            }
         }
         if (delay_fence) {
             SubmitDeferredWork();
@@ -222,13 +249,17 @@ private:
                     return;
                 }
             }
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
             pending_operations.pop_front();
+            auto hold = std::move(pending_holds.front());
+            pending_holds.pop_front();
             for (auto& operation : operations) {
                 operation();
             }
+            hold.Release();
             {
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
@@ -253,22 +284,28 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
+            VideoCommon::GpuSplit::FencedHold hold;
             u8 flushes;
         };
         std::vector<Released> batch;
         batch.reserve(MaxBatch);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
-                             pending_flushes.front()});
+                             std::move(pending_holds.front()), pending_flushes.front()});
             fences.pop();
             pending_operations.pop_front();
+            pending_holds.pop_front();
             pending_flushes.pop_front();
         };
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                cv.wait(lock, [&] {
+                    fence_thread_waiting = !stop_token.stop_requested() && fences.empty();
+                    return !fence_thread_waiting;
+                });
+                fence_thread_waiting = false;
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -283,6 +320,9 @@ private:
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
                 }
+            }
+            if (!batch.empty()) {
+                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
             }
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
@@ -308,6 +348,20 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                released.hold.Release();
+                released.operations.clear();
+            }
+            if (!batch.empty()) {
+                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Fence);
+            }
+            {
+                std::scoped_lock lock{uncommitted_guard};
+                for (Released& released : batch) {
+                    if (spare_operations.size() < MaxSpareOperationLists &&
+                        released.operations.capacity() != 0) {
+                        spare_operations.push_back(std::move(released.operations));
+                    }
+                }
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -325,8 +379,17 @@ private:
                query_cache.ShouldWaitAsyncFlushes();
     }
 
+    /// With uncommitted_guard held, after an operation was queued: the first one the back queues
+    /// holds its entry until the list ran. The ones after it are of the same or later entries.
+    void HoldUncommitted() {
+        if (!uncommitted_hold) {
+            uncommitted_hold = VideoCommon::GpuSplit::Get().TrackFencedWrite();
+        }
+    }
+
     static constexpr u8 TextureFlushes = 1;
     static constexpr u8 BufferFlushes = 2;
+    static constexpr size_t MaxSpareOperationLists = 32;
 
     /// committed: what CommitAsyncFlushes returned for this fence.
     void PopAsyncFlushes(u8 committed) {
@@ -362,7 +425,7 @@ private:
                 flushes.committed |= TextureFlushes;
             }
         }
-        {
+        if (!skip_buffer_half) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
@@ -436,8 +499,19 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    // Vectors, not deques: MSVC's deque of std::function holds one element per block, so every
+    // queued operation (one per query report, about 1000 a frame in busy scenes) allocated a block.
+    using OperationList = std::vector<std::function<void()>>;
+    OperationList uncommitted_operations;
+    std::deque<OperationList> pending_operations;
+    /// The split back's hold on the entries whose operations uncommitted_operations queued (with
+    /// uncommitted_guard), and the same for each list of pending_operations: the front counts
+    /// their semaphore writes in memory once the list ran (GpuSplit::TrackFencedWrite).
+    VideoCommon::GpuSplit::FencedHold uncommitted_hold;
+    std::deque<VideoCommon::GpuSplit::FencedHold> pending_holds;
+    /// Lists the fencing thread ran, kept with their capacity for the next fences (a list grew
+    /// from 64 operations at most fences: ~30 a fence at Ocarina of Time's water, in bursts).
+    std::vector<OperationList> spare_operations; ///< Guarded by uncommitted_guard
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 
@@ -445,6 +519,7 @@ private:
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
     std::condition_variable cv;
+    bool fence_thread_waiting{}; ///< The fencing thread waits on cv for fences (guarded by guard)
 
     std::jthread fence_thread;
 

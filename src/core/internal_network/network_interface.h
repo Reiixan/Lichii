@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -28,7 +27,7 @@ struct NetworkInterface {
     HostAdapterKind kind{HostAdapterKind::Ethernet};
 };
 
-std::vector<NetworkInterface> GetAvailableNetworkInterfaces();
+std::vector<NetworkInterface> GetAvailableNetworkInterfaces(bool include_secondary_ipv4 = false);
 std::optional<NetworkInterface> GetSelectedNetworkInterface();
 void SelectFirstNetworkInterface();
 

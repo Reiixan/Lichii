@@ -1,23 +1,28 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
 #include <optional>
+#include <source_location>
 #include <string_view>
+#include <unordered_set>
+#include <vector>
 
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/unique_function.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/ocarina_camera.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/oot_network.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
@@ -25,13 +30,14 @@
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_fence_manager.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
-#include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vertex_input_cache.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -93,6 +99,13 @@ public:
     ~RasterizerVulkan() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
+
+    /// EDEN_NX2_RENDER_UNLEND: a draw the back posts unlent, which GPURender records.
+    struct UnlentDraw;
+    /// EDEN_NX2_RENDER_UNLEND_CLEAR: a clear the back posts unlent, which GPURender records.
+    struct UnlentClear;
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH: a dispatch the back posts unlent, which GPURender records.
+    struct UnlentDispatch;
     void DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
@@ -105,18 +118,35 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+    void FlushRegionForRead(DAddr addr, u64 size) override;
+    void FinishRead(DAddr addr, u64 size) override;
+    bool NoteReportPending(DAddr addr, u64 size) override;
+    void FinishReport(DAddr addr, u64 size) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
+                                             u64* pending_tick = nullptr) override;
+    bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    bool Nx2ListSlotsSupported() const override;
+    std::optional<u32> Nx2AcquireListSlot() override;
+    void Nx2ReleaseListSlot(u32 slot) override;
+    void Nx2SnapshotListWords(DAddr device_addr, u32 count, u32 slot) override;
+    void Nx2NoteOwedListWord(DAddr device_addr, u32 value) override;
+    void Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) override;
+    void Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) override;
+    void Nx2CheckListSlot(u32 slot, std::span<const u32> words) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
+    bool HoldsQueries(DAddr addr, u64 size) override;
+    bool MayHoldImagesOrReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
@@ -148,14 +178,15 @@ public:
         return true;
     }
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src,
-        const Tegra::Engines::Fermi2D::Surface& dst) override;
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, bool use_history,
+                                   std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -185,16 +216,95 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false,
+                     std::optional<u32> direct_instances = std::nullopt);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
-    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
-    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
+    /// Remembers render target 0 of a draw that can hold Ocarina of Time's tonemapped image.
+    void TrackOotTonemappedImage();
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
-    void FlushWork();
+    /// EDEN_NX2_RENDER_UNLEND, on the back: resolves the pipeline and the buffer half of a warm
+    /// direct draw and posts the rest to GPURender. False when the draw has to be lent instead.
+    bool TryUnlendDraw(bool is_indexed, u32 instance_count);
+    /// EDEN_NX2_RENDER_UNLEND_CLEAR, on the back: posts a clear to GPURender. False when it has
+    /// to be lent instead.
+    bool TryUnlendClear(u32 layer_count);
+    /// GPURender: records an unlent clear from its view of the channel's registers.
+    void PlayUnlentClear(UnlentClear& clear);
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH, on the back: resolves a dispatch's pipeline and buffer
+    /// half and posts the rest to GPURender. False when it has to be lent instead.
+    bool TryUnlendDispatch();
+    /// GPURender: records an unlent dispatch.
+    void PlayUnlentDispatch(UnlentDispatch& dispatch);
+    /// The clear itself, from the engine's registers or GPURender's view of them.
+    void ClearImpl(Tegra::Engines::Maxwell3D::Regs& regs, u32 layer_count);
+    /// The back: posts `op` to GPURender with the state tracker on the view's flags (its submits
+    /// invalidate those, LendEnter hands them to the engine). False when `kind` is not posted.
+    template <typename Op>
+    bool PostRenderOp(VideoCommon::GpuSplit::PostedOp kind, Op&& op);
+    /// EDEN_NX2_RENDER_POST_FENCE: posts a clean immediate fence (`op` makes it on GPURender),
+    /// the closing gather run here first. False when it has to be lent.
+    template <typename Op>
+    bool PostFence(Op&& op);
+    /// Whether a fence of the kind can be posted now (counts why not).
+    bool FencePostable(VideoCommon::GpuSplit::PostedOp kind);
+    template <typename Op>
+    void PostCheckedFence(VideoCommon::GpuSplit::PostedOp kind, Op&& op);
+    /// The back: a report since the last lent fence owes the query sync (PostFence).
+    bool fence_query_owed{};
+    /// The back (EDEN_NX2_RENDER_PAYLOAD_E): the host syncs of the payload releases it wrote, in
+    /// stream order, until a lent call hands them to the query cache (LendEnter).
+    struct PayloadSync {
+        DAddr address;
+        u64 value;
+        u64 size;
+    };
+    std::vector<PayloadSync> back_payload_sync;
+    /// What QueryCacheRuntime::SyncValues records for the values (the buffers' own uploads, then
+    /// the copies), through the buffer arena: the back collects it, GPURender in a lent call
+    /// records it.
+    void RecordPayloadSyncs(std::span<const PayloadSync> syncs);
+    /// EDEN_NX2_RENDER_QUERY_SYNC_E (the back): a report since the last lent sync whose value
+    /// GPURender syncs where the back named no buffer for it (a lent report).
+    bool query_sync_lent_only{};
+    /// The back: the device addresses of the Z-pass reports it posted since the last sync.
+    std::vector<DAddr> samples_slots;
+    /// The value syncs of a posted fence or wait for idle, collected by the back at its place.
+    struct QuerySyncPacket {
+        VideoCommon::CommandArena commands;
+        u64 stamp{};
+        std::vector<QuerySyncTarget> targets;
+    };
+    void CollectQuerySync(QuerySyncPacket& packet);
+    /// The back: whether a sync made now has to be lent for its query values.
+    [[nodiscard]] bool QuerySyncOwed() const;
+    /// The back, lending a fence: GPURender syncs everything pending there.
+    void NoteSyncLent();
+    /// EDEN_NX2_RENDER_POST_FENCE_REPORT: posts a fence-flagged payload report as a fence, its
+    /// value's host sync before it. False when it has to be lent.
+    bool PostFenceReport(GPUVAddr gpu_addr, VideoCommon::QueryPropertiesFlags flags, u32 payload,
+                         u32 subreport);
+    /// GPURender, playing a posted fence: the back ran its closing gather.
+    bool posted_fence_playing{};
+    /// GPURender: records an unlent draw from its view of the channel's registers.
+    void PlayUnlentDraw(UnlentDraw& draw);
+    /// Around each lent call (GpuSplit::SetLendHooks): the engine takes the flags GPURender's
+    /// view holds, and the view takes the engine's after the call; the buffer commands the call
+    /// queued play before it returns.
+    static void* LendEnter(void* rasterizer);
+    static void LendLeave(void* rasterizer, void* engine);
+    /// The registers GPURender's dynamic state reads: its view while it plays an unlent draw.
+    [[nodiscard]] Tegra::Engines::Maxwell3D& DrawEngine() noexcept {
+        return render_engine != nullptr ? *render_engine : *maxwell3d;
+    }
+    /// What a draw leaves for Ocarina of Time's upscalers once recorded.
+    void NoteOcarinaDraw(const GraphicsPipeline& pipeline);
+    void MarkOcarinaEffectsIfAlive();
+
+    void FlushWork(bool ends_pass = false);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -205,6 +315,13 @@ private:
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
     void UpdateDynamicStates(const GraphicsPipeline* pipeline);
+
+    using DynamicCommands = std::vector<Common::UniqueFunction<void, const vk::CommandBuffer&>>;
+    DynamicCommands* dynamic_commands{};
+
+    template <typename F>
+    void RecordDynamic(F&& command,
+                       std::source_location location = std::source_location::current());
 
     void HandleTransformFeedback();
 
@@ -240,17 +357,35 @@ private:
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+    [[nodiscard]] VideoCommon::VertexInputKey VertexInputKeyOf(
+        const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes, u32 max_bindings) const;
 
+    /// A dynamic vertex input state: what vkCmdSetVertexInputEXT is given.
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
+    /// registers VideoCommon::VertexInputKey holds).
+    void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                          u32 max_bindings, VertexInputState& state);
+    /// Dynamic vertex input states built before, by the registers they were built from.
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
+
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Tegra::Engines::Maxwell3D::Regs& regs,
+                           const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
-#ifdef EGLANTINE_STREAMLINE
-    bool OcarinaDlssEnabled() const;
-    void TrackOcarinaCamera();
-    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
-    bool TryOcarinaDlss(const ComputePipeline& pipeline, bool replace);
+    bool OcarinaTemporalEnabled() const;
+    /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
+    /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
+    /// gets new sample positions each frame (the game renders without jitter). The offset goes to
+    /// FSR with the frame.
+    void UpdateOcarinaJitter();
+    bool TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key, bool replace);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
-#endif
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
@@ -260,11 +395,15 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
+    s32 bound_channel_id = -1;
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
     DescriptorPool descriptor_pool;
     GuestDescriptorQueue guest_descriptor_queue;
+    /// EDEN_NX2_RENDER_UNLEND: the back's buffer entries of the draw it unlends.
+    std::optional<GuestDescriptorQueue> unlend_capture;
+    GuestDescriptorQueue& UnlendCapture();
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
     DescriptorBufferRing descriptor_buffer_ring;
     BlitImageHelper blit_image;
@@ -286,8 +425,18 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
-#ifdef EGLANTINE_STREAMLINE
     std::optional<u64> oot_camera_sample_frame;
+    /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
+    struct OcarinaCameraRefusal {
+        u64 frame{};
+        const char* reason{};
+        f32 camera_width{}, camera_height{};
+        u32 target_width{}, target_height{};
+    };
+    std::optional<OcarinaCameraRefusal> oot_camera_refusal;
+    mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// The game started at the DLSS Performance render scale (1920x1080).
+    bool oot_performance_scale{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};
@@ -295,16 +444,34 @@ private:
         GPUVAddr depth_address{};
         u32 depth_tic{};
         VkExtent2D extent{};
+        /// The scene render targets' size: larger than the extent where the game pads them.
+        VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+
+        /// Whether an image holds the whole scene: the game samples padded targets through
+        /// descriptors of the scene's own size.
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent.width || width == image_extent.width) &&
+                   (height == extent.height || height == image_extent.height);
+        }
     } oot_motion;
-    std::unique_ptr<class OcarinaLiveDlss> oot_live_dlss;
+    std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};
     std::optional<u64> oot_dlss_frame;
+    std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
+    std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
+    std::optional<u64> oot_jitter_frame;
+    u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
+    std::optional<u64> oot_effects_frame;
+    GPUVAddr oot_effects_address{};
+    VideoCommon::ImageViewId oot_effects_view{};
+    u32 oot_effects_generation{};
+    u32 oot_effects_stale_warnings{};
     struct OcarinaActorPose {
         u64 frame{};
         const Tegra::MemoryManager* channel{};
@@ -314,7 +481,29 @@ private:
         std::array<f32, 4> origin{};
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
-#endif
+    struct OcarinaCameraFacts {
+        VideoCommon::OcarinaCameraBuffer values;
+        bool gpu_written;
+    };
+    /// What Ocarina's temporal trackers read from guest memory and the buffer cache at a draw,
+    /// taken at the draw's place in the stream (by the back for an unlent draw). GPURender applies
+    /// it with its render targets to the Ocarina state, which only it changes.
+    struct OcarinaDrawFacts {
+        Tegra::MemoryManager* channel{};
+        std::optional<OcarinaCameraFacts> camera;
+        std::optional<OcarinaActorPose> actor;
+    };
+    void TrackOcarinaDraw(u64 shader_hash, bool is_indexed, bool is_indirect);
+    [[nodiscard]] const ImageView* OcarinaCameraTarget() const;
+    [[nodiscard]] std::optional<OcarinaCameraFacts> CaptureOcarinaCamera();
+    void ApplyOcarinaCamera(const ImageView& color, const OcarinaCameraFacts& camera,
+                            const Tegra::MemoryManager* channel);
+    [[nodiscard]] std::optional<OcarinaActorPose> CaptureOcarinaActor();
+    void ApplyOcarinaActor(const OcarinaActorPose& pose);
+    [[nodiscard]] std::unique_ptr<OcarinaDrawFacts> CaptureOcarinaFacts(u64 shader_hash,
+                                                                        bool is_indexed,
+                                                                        bool is_indirect);
+    void ApplyOcarinaFacts(const OcarinaDrawFacts& facts);
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
@@ -348,6 +537,7 @@ private:
         u32 vertex_lines{};
         u32 max_vertices{};
         u32 max_primitives{};
+        u32 primitive_vertices{3};
         std::array<u32, 4> position_lines{};
         bool pending{};
     } mesh_probe;
@@ -366,6 +556,193 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+    /// Mesh emulation: the draw's staging buffers, held until its commands are recorded.
+    /// Configure can submit (an ASTC decode, a full descriptor buffer ring), so the tick when
+    /// they were requested may be older than the submission that writes them.
+    boost::container::static_vector<StagingBufferRef, 4> mesh_draw_buffers;
+    bool mesh_arena_used{};
+    void ReleaseMeshEmulationBuffers();
+
+    /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
+    struct ReusableDraw {
+        GraphicsPipeline* pipeline{};
+        const Tegra::Engines::Maxwell3D* maxwell3d{};
+        u64 serial{};
+        u64 map_serial{};
+        u64 tick{};
+        u64 render_pass{};
+        Maxwell::PrimitiveTopology topology{};
+        bool is_indexed{};
+    };
+    enum class FullDraw : u8 {
+        NoCandidate,
+        Kind,
+        StateChanged,
+        Submitted,
+        RenderPass,
+        DeltaPipeline,
+        HandleBind,
+        HandleData,
+        SampledImages,
+        ComputedHandles,
+        VertexInput,
+        Count,
+    };
+    /// Why a recorded draw can't be followed by a delta draw.
+    enum class Ineligible : u8 {
+        Indirect,
+        Mesh,
+        NotBuilt,
+        WritesImages,
+        TransformFeedback,
+        InlineIndex,
+        Quads,
+        Repacked,
+        NoRenderPass,
+        PipelineNotBound,
+        OffBackThread,
+        Count,
+    };
+    enum class DrawPath : u8 { Full, Delta, Count };
+    struct FastDrawStats {
+        u64 delta{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full{};
+        std::array<u64, static_cast<size_t>(Ineligible::Count)> ineligible{};
+        /// PrepareDraw time and draws per path.
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
+        std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// EDEN_NX2_FAST_DRAW_VERIFY
+        u64 verified{};
+        u64 pipeline_mismatches{};
+        u64 view_mismatches{};
+        u64 binding_mismatches{};
+        /// Draws whose recorded dynamic vertex input isn't what the registers give.
+        u64 vertex_input_mismatches{};
+        /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
+        std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
+        /// StateChanged draws by the reason of the last break, and by its 3D method.
+        std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
+        std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        u64 window_start{};
+    };
+    /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
+    /// the remembered draw either way: only a recorded draw remembers one again.
+    GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    /// Writes the GPU-written list word `real` over its placeholder `value` at `device_addr`
+    /// (Nx2ListIndirect), unless something wrote the word since, and tells the caches.
+    bool Nx2LandOwedWord(DAddr device_addr, u32 value, u32 real);
+
+    /// The buffer half of an inline upload: uploads into GPU-written buffer data. Whether it
+    /// uploaded.
+    bool InlineBufferHalf(DAddr cpu_addr, size_t copy_size, std::span<const u8> memory, bool defer);
+    void TraceInlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory,
+                             std::optional<DAddr> cpu_addr);
+    /// The back (EDEN_NX2_RENDER_POST_INLINE): writes guest memory and runs the buffer half
+    /// itself, and posts GPURender's half (the collected uploads, the query and image
+    /// invalidations). False to lend the call: an upload over a shader page.
+    bool PostInlineToMemory(GPUVAddr address, size_t copy_size, std::span<const u8> memory);
+    VideoCommon::CommandArena inline_commands;
+    /// The back (EDEN_NX2_RENDER_POST_CONDITIONAL): a dynamic render enable may have set host
+    /// conditional rendering since the last end it posted.
+    bool host_conditional_may_be_set{true};
+    /// The back (EDEN_NX2_RENDER_FLUSH_E): flush answers given without a lend, for the sampled
+    /// check (EDEN_NX2_RENDER_VERIFY_EVERY).
+    u64 back_flush_answers{};
+    void VerifyBackFlushAnswer(DAddr addr, u64 size, VideoCommon::CacheType which);
+
+    void InvalidateCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences,
+                                bool constant_buffer_data, bool buffer_half_only);
+    /// The back (EDEN_NX2_RENDER_INVAL_E): whether it applies these writes' buffer half itself.
+    /// No range is on a page a shader was registered on, nor a page holding GPU-written buffer
+    /// data. A range on an image or query page lends the call, or with
+    /// EDEN_NX2_RENDER_POST_INVAL posts GPURender's half (the caches in rest); otherwise the
+    /// writes are stamped for GPURender's uploads. With gpu_written (EDEN_NX2_RENDER_GATHER_E), a
+    /// range on GPU-written buffer data stays when the buffer cache uploads it into its buffer.
+    template <typename Size>
+    bool BackTakesInvalidation(std::span<const std::pair<DAddr, Size>> ranges,
+                               VideoCommon::GpuSplit::InvalSite site, VideoCommon::CacheType rest,
+                               bool gpu_written = false);
+    /// The back (EDEN_NX2_RENDER_GATHER_E): a gather's uploads into GPU-written buffer data.
+    VideoCommon::CommandArena gather_commands;
+    /// The back (EDEN_NX2_RENDER_LIST_WORDS_E): whether it records a list word snapshot or owed
+    /// word itself, collected into list_word_commands.
+    bool ListWordsOnBack();
+    /// Posts list_word_commands; noted is an owed word's arena stamp (0: none).
+    void PostListWords(bool snapshot, u64 noted);
+    VideoCommon::CommandArena list_word_commands;
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
+    /// map_serial as read then), and the images it samples need no preparing.
+    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                          u64 map_serial);
+    void ReportFastDraws();
+
+    /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
+    /// frames, leaving out uniform buffers) was in the previous frame, only earlier in this one,
+    /// or in neither.
+    enum class DrawReuse : u8 { Hit, Repeat, Miss, Count };
+    struct DrawReuseProbe {
+        std::unordered_set<u64> previous_frame;
+        std::unordered_set<u64> frame;
+        std::array<std::array<u64, static_cast<size_t>(DrawPath::Count)>,
+                   static_cast<size_t>(DrawReuse::Count)>
+            draws{}, prepare_ns{};
+        u64 gate_ns{}; ///< Full-path hits: their PrepareDraw time over 1.1 us
+        u64 probe_ns{}; ///< NoteDrawReuse's own time, left out of prepare_ns
+        u64 frames{};
+        u64 window_start{};
+    };
+    /// Classifies the draw just configured with `pipeline` and adds its key to the frame's.
+    DrawReuse NoteDrawReuse(const GraphicsPipeline& pipeline, bool is_indexed);
+    void TickDrawReuse();
+    DrawReuseProbe draw_reuse;
+
+    ReusableDraw reusable_draw;
+    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
+    std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
+               Maxwell::MaxShaderStage>
+        handle_spans;
+    /// The constant buffer binds and data since the previous draw.
+    VideoCommon::Nx2FastDraw::Delta taken_delta;
+    /// taken_delta hasn't reached BeginGraphicsUniforms yet (the draw may still stop before).
+    bool taken_delta_unconsumed{};
+    /// Constant buffer data since the last BeginGraphicsUniforms that no delta it got holds.
+    bool uniform_writes_lost{};
+    FastDrawStats fast_draw_stats;
+    /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
+    bool fast_draw_on{};
+    bool fast_draw_verify{};
+    /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds, so UpdateVertexInput compares
+    /// the vertex input recorded last with what the registers give now.
+    bool verify_vertex_input{};
+    /// The draw's pipeline puts every vertex on the far plane and the game set no polygon offset
+    /// for it: it gets a depth bias towards the far value and depth clamping (see
+    /// UpdateDynamicStates).
+    bool far_plane_draw{};
+    /// EDEN_NX2_RENDER_UNLEND: the view GPURender records an unlent draw from (DrawEngine).
+    Tegra::Engines::Maxwell3D* render_engine{};
+    /// Set in a lent gather that reached GPURender's caches (images, queries, shaders).
+    bool unlend_gather_hit{};
+    /// The back forced this lent draw to compare its view (EDEN_NX2_RENDER_VERIFY_EVERY).
+    bool unlend_verify_draw{};
+    u64 unlend_candidates{};
+    /// EDEN_NX2_RENDER_UNLEND_FAST_DELTA: the pipeline lookup of the back's last unlent draw.
+    struct UnlentLookup {
+        const Tegra::Engines::Maxwell3D* engine{};
+        u64 lookups{};
+        Maxwell::PrimitiveTopology topology{};
+    };
+    UnlentLookup unlent_lookup;
+    /// With EDEN_NX2_RENDER_VERIFY_EVERY: the vertex input recorded last and its tick.
+    VideoCommon::VertexInputKey recorded_input_key;
+    u64 recorded_input_tick{};
+    /// The back forced this lent clear to compare its view (EDEN_NX2_RENDER_VERIFY_EVERY).
+    bool unlend_verify_clear{};
+    u64 unlend_clear_candidates{};
+    float depth_bias_slope_scale = 1.0f;
+    VertexInputState recorded_vertex_input;
+    bool vertex_input_recorded{};
 
     struct IndirectTrace {
         vk::Buffer readback;

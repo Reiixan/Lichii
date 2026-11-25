@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -57,6 +56,7 @@ enum class RelaxedOptions : u32 {
     Format = 1 << 1,
     Samples = 1 << 2,
     ForceBrokenViews = 1 << 3,
+    RequireBlockLayout = 1 << 4,
 };
 DECLARE_ENUM_FLAG_OPERATORS(RelaxedOptions)
 

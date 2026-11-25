@@ -268,6 +268,15 @@ class CliTests(unittest.TestCase):
         self.assertTrue(any("workgroup 1x1x1" in item for item in result["assumptions"]))
         self.validate()
 
+    def test_device_profile(self):
+        source = self.write("native.bin", NATIVE_EXIT)
+        profile = self.write("profile.json", json.dumps({"profile": {"supported_spirv": 0x00010600}}).encode())
+        result = self.run_cli(source, "--stage", "compute", "--device-profile", profile, "--output", self.output)
+        self.assertTrue(any("--device-profile" in item for item in result["assumptions"]))
+        self.assertEqual(struct.unpack_from("<I", self.output.read_bytes(), 4)[0], 0x00010600)
+        unknown = self.write("unknown.json", json.dumps({"host": {"no_such_field": True}}).encode())
+        self.run_cli(source, "--stage", "compute", "--device-profile", unknown, "--output", self.output, code=2)
+
     def test_exact_native_header_stages(self):
         for stage, name in enumerate(STAGES[:5]):
             with self.subTest(stage=name):
@@ -311,7 +320,7 @@ class CliTests(unittest.TestCase):
 
     def test_both_cache_versions_all_stages(self):
         """Validate ordinary stage output for each supported cache version."""
-        for version in (46, 47, 48, 49, 50, 51, 52, 53):
+        for version in range(46, 55):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
@@ -368,6 +377,10 @@ class CliTests(unittest.TestCase):
             self.run_cli(source, "--lower-only", self.output, code=2)
         capture = self.write("shader.env", environment(46, 5))
         self.run_cli("--environment", capture, "--cache-version", 50, "--output", self.output, code=2)
+        for version in ("45", "55", "5x", "054"):
+            result = self.run_cli("--environment", capture, "--cache-version", version,
+                                  "--output", self.output, code=2)
+            self.assertEqual(result["error"]["message"], "Expected cache version 46 to 54")
         source = self.write("native.bin", bytes(16))
         result = self.run_cli(source, "--lower-only", self.output, code=1)
         self.assertEqual(result["phase"], "lower")

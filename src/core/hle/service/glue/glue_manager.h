@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <map>
+#include <optional>
 #include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/romfs_factory.h"
@@ -41,6 +41,8 @@ public:
     // the provided title ID if it was previously registered, otherwise ResultProcessIdNotRegistered
     // if it was never registered or ResultInvalidProcessId if the title ID is 0.
     Result GetControlProperty(std::vector<u8>* out_control_property, u64 title_id) const;
+
+    std::optional<u32> GetSupportedLanguages(u64 title_id) const;
 
     // Adds a new entry to the internal database with the provided parameters, returning
     // ResultProcessIdNotRegistered if attempting to re-register a title ID without an intermediate

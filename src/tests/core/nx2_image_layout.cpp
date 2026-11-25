@@ -26,6 +26,54 @@ TEST_CASE("Native color image requirements accept page-aligned storage", "[nx2_i
     REQUIRE(0x1000 + layout.size <= 0x3000000);
 }
 
+TEST_CASE("Native RGB10A2 storage preserves four-byte geometry", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 4;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.width == 3840);
+    REQUIRE(layout.height == 2160);
+    REQUIRE(layout.pitch == 0x3C00);
+    REQUIRE(layout.size == 0x1FE0000);
+    REQUIRE(layout.alignment == 0x2000);
+}
+
+TEST_CASE("Xenoblade 2 window buffers accept page-aligned offsets", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[7] = 2;
+    const auto layout = Service::Nx2CalculateNativeImageRequirements(preference, 1);
+    REQUIRE(layout.pitch == 0x3C00);
+    REQUIRE(layout.block_height_log2 == 7);
+    REQUIRE(layout.size == 0x1FE0000);
+    REQUIRE(layout.alignment == 0x1000);
+    REQUIRE((0x5FA2000 & (layout.alignment - 1)) == 0);
+    REQUIRE((0x7F83000 & (layout.alignment - 1)) == 0);
+    REQUIRE((0x7F83800 & (layout.alignment - 1)) != 0);
+    REQUIRE(Service::Nx2CalculateImageLayout(preference.data()).alignment == 0x2000);
+}
+
+TEST_CASE("Native FP16 storage uses eight-byte geometry", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 5;
+    preference[5] = 480;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.width == 3840);
+    REQUIRE(layout.height == 2160);
+    REQUIRE(layout.pitch == 0x7800);
+    REQUIRE(layout.block_height_log2 == 7);
+    REQUIRE(layout.size == 0x3FC0000);
+    REQUIRE(layout.alignment == 0x2000);
+}
+
+TEST_CASE("Native FP16 rejects a pitch sized for four-byte pixels", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 5;
+    preference[4] = 3;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.pitch == 0x7800);
+    REQUIRE(layout.block_height_log2 == 7);
+    REQUIRE(layout.size == 0x3FC0000);
+}
+
 TEST_CASE("Native image base alignment does not shrink tile geometry", "[nx2_image_layout]") {
     auto preference = ColorPreference;
     preference[4] = 8;
@@ -48,7 +96,7 @@ TEST_CASE("Native image base alignment does not shrink tile geometry", "[nx2_ima
 
 TEST_CASE("Unrecognized native image requirements preserve existing layout", "[nx2_image_layout]") {
     for (u32 field = 0; field < ColorPreference.size(); ++field) {
-        if (field == 2 || field == 4 || field == 5) {
+        if (field == 2 || field == 4 || field == 5 || field == 7) {
             continue;
         }
         auto preference = ColorPreference;
@@ -58,6 +106,12 @@ TEST_CASE("Unrecognized native image requirements preserve existing layout", "[n
         CAPTURE(field);
         REQUIRE(native.size == generic.size);
         REQUIRE(native.alignment == generic.alignment);
+    }
+    for (const u32 block_format : {0U, 3U, 0x102U}) {
+        auto preference = ColorPreference;
+        preference[7] = block_format;
+        const auto layout = Service::Nx2CalculateNativeImageRequirements(preference, 1);
+        REQUIRE(layout.alignment == 0x2000);
     }
     for (const u32 count : {0U, 2U, 3U}) {
         const auto layout = Service::Nx2CalculateNativeImageRequirements(ColorPreference, count);
@@ -79,4 +133,19 @@ TEST_CASE("Unrecognized native image requirements preserve existing layout", "[n
         REQUIRE(native.size == generic.size);
         REQUIRE(native.alignment == generic.alignment);
     }
+}
+
+TEST_CASE("Native image colour space follows the HDR answer, not the format",
+          "[nx2_image_layout]") {
+    using Service::Nx2NativeImageColorSpace;
+    using Service::Nx2NativeImageFormat;
+    // Fortune's Weave: SDR in RGB10A2 while told SDR.
+    REQUIRE(Nx2NativeImageColorSpace(Nx2NativeImageFormat::Rgb10A2, false) ==
+            Tegra::ColorSpace::RGB709);
+    REQUIRE(Nx2NativeImageColorSpace(Nx2NativeImageFormat::Rgb10A2, true) ==
+            Tegra::ColorSpace::RGB2020_PQ);
+    REQUIRE(Nx2NativeImageColorSpace(Nx2NativeImageFormat::Rgba8, true) ==
+            Tegra::ColorSpace::RGB709);
+    REQUIRE(Nx2NativeImageColorSpace(Nx2NativeImageFormat::Rgba16Float, false) ==
+            Tegra::ColorSpace::RGB709_Linear);
 }

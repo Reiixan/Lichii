@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -40,6 +39,11 @@ XCI::XCI(VirtualFile file_, u64 program_id, size_t program_index)
         return;
     }
 
+    if (header.hfs_offset > file->GetSize()) {
+        status = Loader::ResultStatus::ErrorBadXCIHeader;
+        return;
+    }
+
     PartitionFilesystem main_hfs(std::make_shared<OffsetVfsFile>(
         file, file->GetSize() - header.hfs_offset, header.hfs_offset));
 
@@ -58,9 +62,12 @@ XCI::XCI(VirtualFile file_, u64 program_id, size_t program_index)
         partitions_raw[static_cast<std::size_t>(partition)] = std::move(raw);
     }
 
-    secure_partition = std::make_shared<NSP>(
-        main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]),
-        program_id, program_index);
+    auto secure_raw = main_hfs.GetFile(partition_names[static_cast<std::size_t>(XCIPartition::Secure)]);
+    if (secure_raw == nullptr) {
+        status = Loader::ResultStatus::ErrorXCIMissingPartition;
+        return;
+    }
+    secure_partition = std::make_shared<NSP>(std::move(secure_raw), program_id, program_index);
 
     ncas = secure_partition->GetNCAsCollapsed();
     program =
@@ -172,7 +179,8 @@ u64 XCI::GetProgramTitleID() const {
 }
 
 std::vector<u64> XCI::GetProgramTitleIDs() const {
-    return secure_partition->GetProgramTitleIDs();
+    return secure_partition != nullptr ? secure_partition->GetApplicationProgramTitleIDs()
+                                       : std::vector<u64>{};
 }
 
 u32 XCI::GetSystemUpdateVersion() {
@@ -299,17 +307,17 @@ Loader::ResultStatus XCI::AddNCAFromPartition(XCIPartition part) {
         if (nca->IsUpdate()) {
             continue;
         }
-        if (nca->GetType() == NCAContentType::Program) {
-            program_nca_status = nca->GetStatus();
-        }
-        if (nca->GetStatus() == Loader::ResultStatus::Success) {
-            ncas.push_back(std::move(nca));
-        } else {
+        if (nca->GetStatus() != Loader::ResultStatus::Success) {
             const u16 error_id = static_cast<u16>(nca->GetStatus());
             LOG_CRITICAL(Loader, "Could not load NCA {}/{}, failed with error code {:04X} ({})",
                          partition_names[partition_index], nca->GetName(), error_id,
                          nca->GetStatus());
+            continue;
         }
+        if (nca->GetType() == NCAContentType::Program) {
+            program_nca_status = nca->GetStatus();
+        }
+        ncas.push_back(std::move(nca));
     }
 
     return Loader::ResultStatus::Success;

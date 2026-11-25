@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_file.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 
 namespace Service::FileSystem {
 
@@ -34,6 +34,7 @@ Result IFile::Read(
               size);
 
     // Read the data from the Storage backend
+    const ReadTraceScope trace{ReadTraceSource::File, size};
     R_RETURN(
         backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
 }

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <memory>
 
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/cmif_serialization.h"
@@ -69,6 +69,8 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
 
 IUserLocalCommunicationService::~IUserLocalCommunicationService() {
     if (is_initialized) {
+        // Stops a LAN play worker that would signal the event
+        lan_discovery.Finalize();
         if (auto room_member = Network::GetRoomMember().lock()) {
             room_member->Unbind(ldn_packet_received);
         }
@@ -106,11 +108,13 @@ Result IUserLocalCommunicationService::GetIpv4Address(Out<Ipv4Address> out_curre
     *out_current_address = {Network::TranslateIPv4(network_interface->ip_address)};
     *out_subnet_mask = {Network::TranslateIPv4(network_interface->subnet_mask)};
 
-    // When we're connected to a room, spoof the hosts IP address
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        if (room_member->IsConnected()) {
-            *out_current_address = room_member->GetFakeIpAddress();
-        }
+    // When LDN goes through a joined room, spoof the hosts IP address. The mask must match the
+    // room's /24 too: the room relays only x.x.x.255 as a broadcast, and a VPN adapter's /32 mask
+    // would point the game's broadcasts at its own address.
+    if (auto room_member = Network::GetRoomMember().lock();
+        room_member && room_member->IsConnected() && !lan_discovery.IsDirectLan()) {
+        *out_current_address = room_member->GetFakeIpAddress();
+        *out_subnet_mask = {255, 255, 255, 0};
     }
 
     std::reverse(std::begin(*out_current_address), std::end(*out_current_address)); // ntohl
@@ -289,7 +293,15 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
     const auto network_interface = Network::GetSelectedNetworkInterface();
     R_UNLESS(network_interface, ResultAirplaneModeEnabled);
 
-    if (auto room_member = Network::GetRoomMember().lock()) {
+    // A joined room carries the guest's sockets, so it carries LDN too
+    auto room_member = Network::GetRoomMember().lock();
+    if (Settings::values.lan_play.GetValue() && !(room_member && room_member->IsConnected())) {
+        R_TRY(lan_discovery.Initialize([&]() { OnEventFired(); }, network_interface));
+        is_initialized = true;
+        R_SUCCEED();
+    }
+
+    if (room_member) {
         ldn_packet_received = room_member->BindOnLdnPacketReceived(
             [this](const Network::LDNPacket& packet) { OnLDNPacketReceived(packet); });
     } else {

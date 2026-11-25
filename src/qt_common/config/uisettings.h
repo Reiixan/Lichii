@@ -61,17 +61,12 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    LichiiDark,
 };
 
-static constexpr Theme default_theme{
-#ifdef _WIN32
-    Theme::DarkColorful
-#else
-    Theme::DefaultColorful
-#endif
-};
+static constexpr Theme default_theme{Theme::LichiiDark};
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
 
 struct GameDir {
@@ -98,6 +93,7 @@ struct Values {
 
     Setting<bool> single_window_mode{linkage, true, "singleWindowMode", Category::Ui};
     Setting<bool> fullscreen{linkage, false, "fullscreen", Category::Ui};
+    Setting<bool> preserve_window_size{linkage, false, "preserveWindowSize", Category::Ui};
     Setting<bool> show_filter_bar{linkage, true, "showFilterBar", Category::Ui};
     Setting<bool> show_status_bar{linkage, true, "showStatusBar", Category::Ui};
 
@@ -110,6 +106,8 @@ struct Values {
                                                            true};
 
     Setting<bool> first_start{linkage, true, "firstStart", Category::Ui};
+    Setting<u32> last_seen_release{linkage, 0, "last_seen_release", Category::Ui};
+    Setting<bool> show_low_ram_warning{linkage, true, "show_low_ram_warning", Category::Ui};
     Setting<bool> pause_when_in_background{linkage,
                                            false,
                                            "pauseWhenInBackground",
@@ -159,6 +157,9 @@ struct Values {
 
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
+    Setting<std::string> mod_store_api_url{linkage, "https://lichii-api.zortos.me",
+                                           "mod_store_api_url", Category::Ui,
+                                           Settings::Specialization::Default, false};
 
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
@@ -211,7 +212,9 @@ struct Values {
 
     // Game List
     Setting<bool> show_add_ons{linkage, true, "show_add_ons", Category::UiGameList};
-    Setting<u32, true> game_icon_size{linkage, 64, 0, 512, "game_icon_size", Category::UiGameList};
+    Setting<u32, true> game_icon_size{linkage, 44, 0, 512, "game_icon_size", Category::UiGameList};
+    Setting<u32, true> game_cover_size{
+        linkage, 160, 0, 512, "game_cover_size", Category::UiGameList};
     Setting<u32, true> folder_icon_size{linkage, 48, 8, 512, "folder_icon_size", Category::UiGameList};
     Setting<u8> row_1_text_id{linkage, 3, "row_1_text_id", Category::UiGameList};
     Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
@@ -244,13 +247,16 @@ struct Values {
 
 extern Values values;
 
+// The list rows and the grid/carousel covers keep separate sizes.
+Setting<u32, true>& CurrentGameIconSize();
+
 u32 CalculateWidth(u32 height, Settings::AspectRatio ratio);
 
 void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 32> default_hotkeys;
+extern const std::array<Shortcut, 35> default_hotkeys;
 
 } // namespace UISettings
 

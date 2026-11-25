@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -34,9 +33,14 @@ template<typename T>
     return T(MostSignificantBit<T>(value));
 }
 
+/// The exponent of the smallest power of two that is at least value. 0 for 0: a zero-size
+/// request fits the smallest bucket, where Log2Floor(0) would wrap and index far out of range.
 template<typename T>
     requires std::is_integral_v<T>
 [[nodiscard]] constexpr T Log2Ceil(const T value) {
+    if (value == T(0)) {
+        return T(0);
+    }
     const T log2_f = Log2Floor<T>(value);
     return T(log2_f + T((value ^ (T(1ULL) << log2_f)) != T(0ULL)));
 }

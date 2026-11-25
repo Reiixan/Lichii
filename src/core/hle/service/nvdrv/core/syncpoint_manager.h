@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2022 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -7,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <optional>
 
 #include "common/common_types.h"
 #include "core/hle/service/nvdrv/nvdata.h"
@@ -52,6 +52,9 @@ public:
      */
     u32 AllocateSyncpoint(bool client_managed);
 
+    /// Reserves a free nonzero ID, or reports exhaustion without changing reservations.
+    std::optional<u32> TryAllocateSyncpoint(bool client_managed);
+
     /**
      * @url
      * https://github.com/Jetson-TX1-AndroidTV/android_kernel_jetson_tx1_hdmi_primary/blob/8f74a72394efb871cb3f886a3de2998cd7ff2990/drivers/gpu/host1x/syncpt.c#L259
@@ -72,6 +75,14 @@ public:
      * @return The minimum value of the syncpoint
      */
     u32 ReadSyncpointMinValue(u32 id);
+
+    /**
+     * @return The maximum value of the syncpoint, without checking that it is allocated
+     * (IsSyncpointAllocated)
+     */
+    u32 PeekSyncpointMaxValue(u32 id) const {
+        return syncpoints[id].counter_max.load(std::memory_order_relaxed);
+    }
 
     /**
      * @brief Synchronises the minimum value of the syncpoint to with the GPU

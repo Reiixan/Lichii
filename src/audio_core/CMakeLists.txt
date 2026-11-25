@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(audio_core STATIC
@@ -209,6 +208,7 @@ add_library(audio_core STATIC
     renderer/voice/voice_state.h
     sink/null_sink.h
     sink/input_processing.h
+    sink/silent_input_stream.h
     sink/sink.h
     sink/sink_details.cpp
     sink/sink_details.h

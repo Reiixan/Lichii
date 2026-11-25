@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
@@ -105,12 +104,6 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
         return {ResultStatus::ErrorAlreadyLoaded, {}};
     }
 
-    const auto title_id = nsp->GetProgramTitleID();
-
-    if (!nsp->IsExtractedType() && title_id == 0) {
-        return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
-    }
-
     const auto nsp_status = nsp->GetStatus();
     if (nsp_status != ResultStatus::Success) {
         return {nsp_status, {}};
@@ -121,12 +114,22 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
         return {nsp_program_status, {}};
     }
 
+    const auto title_id = nsp->GetProgramTitleID();
+
+    if (!nsp->IsExtractedType() && title_id == 0) {
+        return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
+    }
+
     if (!nsp->IsExtractedType() &&
         nsp->GetNCA(title_id, FileSys::ContentRecordType::Program) == nullptr) {
         if (!Core::Crypto::KeyManager::KeyFileExists(false)) {
             return {ResultStatus::ErrorMissingProductionKeyFile, {}};
         }
 
+        return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
+    }
+
+    if (secondary_loader == nullptr) {
         return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
     }
 
@@ -189,6 +192,9 @@ ResultStatus AppLoader_NSP::VerifyIntegrity(std::function<bool(size_t, size_t)> 
 }
 
 ResultStatus AppLoader_NSP::ReadRomFS(FileSys::VirtualFile& out_file) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
     return secondary_loader->ReadRomFS(out_file);
 }
 
@@ -197,8 +203,7 @@ ResultStatus AppLoader_NSP::ReadUpdateRaw(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNoPackedUpdate;
     }
 
-    const auto read = nsp->GetNCAFile(FileSys::GetUpdateTitleID(nsp->GetProgramTitleID()),
-                                      FileSys::ContentRecordType::Program);
+    const auto read = nsp->GetPackedUpdateFile(nsp->GetProgramTitleID());
 
     if (read == nullptr) {
         return ResultStatus::ErrorNoPackedUpdate;
@@ -222,7 +227,7 @@ ResultStatus AppLoader_NSP::ReadProgramId(u64& out_program_id) {
 }
 
 ResultStatus AppLoader_NSP::ReadProgramIds(std::vector<u64>& out_program_ids) {
-    out_program_ids = nsp->GetProgramTitleIDs();
+    out_program_ids = nsp->GetApplicationProgramTitleIDs();
     return ResultStatus::Success;
 }
 
@@ -232,6 +237,20 @@ ResultStatus AppLoader_NSP::ReadIcon(std::vector<u8>& buffer) {
     }
 
     buffer = icon_file->ReadAllBytes();
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NSP::ReadOriginalIcon(std::vector<u8>& buffer) const {
+    const auto control =
+        nsp->GetNCA(FileSys::GetBaseTitleID(nsp->GetProgramTitleID()), FileSys::ContentRecordType::Control);
+    if (control == nullptr || control->GetStatus() != ResultStatus::Success) {
+        return ResultStatus::ErrorNoControl;
+    }
+    const auto [nacp, icon] = FileSys::PatchManager::ParseControlRomFS(control->GetRomFS());
+    if (icon == nullptr) {
+        return ResultStatus::ErrorNoIcon;
+    }
+    buffer = icon->ReadAllBytes();
     return ResultStatus::Success;
 }
 
@@ -265,15 +284,32 @@ ResultStatus AppLoader_NSP::ReadManualRomFS(FileSys::VirtualFile& out_file) {
 }
 
 ResultStatus AppLoader_NSP::ReadBanner(std::vector<u8>& buffer) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
     return secondary_loader->ReadBanner(buffer);
 }
 
 ResultStatus AppLoader_NSP::ReadLogo(std::vector<u8>& buffer) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
     return secondary_loader->ReadLogo(buffer);
 }
 
 ResultStatus AppLoader_NSP::ReadNSOModules(Modules& modules) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
     return secondary_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NSP::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    return secondary_loader->ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

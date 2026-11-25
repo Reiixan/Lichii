@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <cstring>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -64,6 +65,19 @@ public:
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
     }
 
+    [[nodiscard]] bool HasRejectedTexelBuffer() const noexcept {
+        return rejected_texel_buffer;
+    }
+
+    void RejectTexelBuffer() {
+        rejected_texel_buffer = true;
+        AddTexelBuffer(VK_NULL_HANDLE);
+    }
+
+    void ReplaceSampledImage(size_t entry, VkImageView image_view) {
+        upload_start[entry].image.imageView = image_view;
+    }
+
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
         *(payload_cursor++) = VkDescriptorImageInfo{
             .sampler = sampler,
@@ -105,6 +119,20 @@ public:
         *(payload_cursor++) = texel_buffer;
     }
 
+    /// EDEN_NX2_RENDER_UNLEND: a queue of the back's own collects an unlent draw's buffer entries
+    /// from the start of its payload, without the scheduler (GraphicsPipeline::ConfigureBack).
+    void BeginCapture(bool use_descriptor_buffer_) {
+        use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+        rejected_texel_buffer = false;
+        payload_start = payload_cursor = upload_start = payload.get();
+    }
+
+    /// Entries an earlier draw added (delta draws).
+    void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
+        std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
+        payload_cursor += entries.size();
+    }
+
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,
                         VkDeviceSize offset, VkDeviceSize size, VkFormat format) {
         if (!use_descriptor_buffer) {
@@ -124,10 +152,11 @@ private:
     const size_t maximum_frame_payload_size;
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
+    bool rejected_texel_buffer{};
     size_t frame_index{0};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
-    const DescriptorUpdateEntry* upload_start = nullptr;
+    DescriptorUpdateEntry* upload_start = nullptr;
     std::unique_ptr<DescriptorUpdateEntry[]> payload;
     bool growth_disabled{};
     bool fallback_reported{};

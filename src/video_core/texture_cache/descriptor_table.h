@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -36,6 +35,7 @@ public:
         // Cleared on the next read: the texture cache invalidates every channel's tables for
         // each image it deletes, dozens of times a frame while its collector runs.
         invalidated = true;
+        ++changes;
     }
 
     std::span<Id> LiveBoundIds() noexcept {
@@ -43,9 +43,17 @@ public:
             (std::min)(bound_ids.size(), size_t{current_limit} + 1));
     }
 
+    [[nodiscard]] bool ContainsIndex(u32 index) const noexcept {
+        return index <= current_limit && index < bound_ids.size();
+    }
+
+    void Retry(u32 index) noexcept {
+        read_descriptors[index / 64] &= ~(1ULL << (index % 64));
+    }
+
     template <class MemoryManager>
     [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
-        DEBUG_ASSERT(index <= current_limit);
+        DEBUG_ASSERT(ContainsIndex(index));
         if (invalidated) {
             ClearReadDescriptors();
             invalidated = false;
@@ -55,7 +63,7 @@ public:
         // This runs for every texture and sampler of every draw. An entry within one page is
         // contiguous in host memory, so a single page lookup replaces the generic block read.
         const bool one_page =
-            (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
+            (gpu_addr & Core::Memory::LICHII_PAGEMASK) + sizeof(T) <= Core::Memory::LICHII_PAGESIZE;
         if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
             std::memcpy(std::addressof(result.first), host, sizeof(T));
         } else {
@@ -76,6 +84,7 @@ public:
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
         current_gpu_addr = gpu_addr;
         current_limit = limit;
+        ++changes;
         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
         const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
@@ -93,6 +102,9 @@ public:
     GPUVAddr current_gpu_addr{};
     u32 current_limit{};
     bool invalidated{}; ///< read_descriptors is to be cleared before the next read
+    /// Bumped by every Invalidate and Refresh: the ids and descriptors read before are only good
+    /// while it stays the same.
+    u64 changes{};
 
 private:
     void ClearReadDescriptors() noexcept {

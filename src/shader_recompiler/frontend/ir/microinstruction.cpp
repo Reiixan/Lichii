@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -78,6 +77,9 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::Barrier:
     case Opcode::WorkgroupMemoryBarrier:
     case Opcode::DeviceMemoryBarrier:
+    case Opcode::BarrierVoteInit:
+    case Opcode::BarrierVote:
+    case Opcode::VotedBarrier:
     case Opcode::EmitVertex:
     case Opcode::EndPrimitive:
     case Opcode::SetAttribute:
@@ -308,7 +310,7 @@ void Inst::SetArg(size_t index, Value value) {
         Use(value);
     }
     if (op == Opcode::Phi) {
-        phi_args[index].second = value;
+        phi_args[index].second = PhiOperand(value);
     } else {
         args[index] = value;
     }
@@ -324,11 +326,15 @@ Block* Inst::PhiBlock(size_t index) const {
     return phi_args[index].first;
 }
 
+Value Inst::PhiOperand(const Value& value) {
+    return value.IsImmediate() && !value.IsEmpty() ? value.Resolve() : value;
+}
+
 void Inst::AddPhiOperand(Block* predecessor, const Value& value) {
     if (!value.IsImmediate()) {
         Use(value);
     }
-    phi_args.emplace_back(predecessor, value);
+    phi_args.emplace_back(predecessor, PhiOperand(value));
 }
 
 void Inst::OrderPhiArgs() {

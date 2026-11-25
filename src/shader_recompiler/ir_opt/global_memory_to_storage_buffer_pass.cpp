@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -26,6 +25,7 @@
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/storage_write_extent.h"
 
 namespace Shader::Optimization {
 namespace {
@@ -38,6 +38,15 @@ struct StorageBufferAddr {
     /// Offset of the buffer pointer in the memory the constant buffer pointer points to
     u32 indirect{~0U};
 };
+
+/// True when the range holds the address. Compares through a predicate: MSVC 14.51's STL sends
+/// std::ranges::find on this 12-byte type to its vectorized search, which only takes elements of
+/// 1, 2, 4 or 8 bytes and fails a static assertion.
+template <typename Range>
+bool ContainsAddr(const Range& range, const StorageBufferAddr& addr) {
+    return std::ranges::any_of(range,
+                               [&addr](const StorageBufferAddr& other) { return other == addr; });
+}
 
 /// Block iterator to a global memory instruction and the storage buffer it uses
 struct StorageInst {
@@ -62,6 +71,33 @@ using StorageInstVector = small_vector<StorageInst, 24>;
 using StorageWritesSet =
     flat_set<StorageBufferAddr, std::less<StorageBufferAddr>, small_vector<StorageBufferAddr, 16>>;
 
+/// Slots first + n * stride of a pointer array read at a dynamic offset (stride is not zero)
+struct PointerArray {
+    StorageBufferAddr first;
+    u32 stride;
+};
+
+/// The pointers a native global access's address can come from, see NativePointerCandidates
+struct NativeCandidates {
+    small_vector<StorageBufferAddr, 4> pointers;
+    /// Arrays the pointers were read from at a dynamic offset. The search takes their first slots
+    /// only, and any slot is one the address can come from.
+    small_vector<PointerArray, 2> arrays;
+    /// Every path of the address reaches one of the pointers. Otherwise a path goes through an
+    /// instruction the search does not follow, or a table entry it left out, and can carry a
+    /// pointer bound for another access.
+    bool complete{};
+    /// The access block the table holder search left phi inputs out for (see AllowsPhi)
+    const IR::Block* pruned_at{};
+};
+
+/// A global access left for the backend to route among its own candidate buffers
+struct RoutedAccess {
+    IR::Inst* inst;
+    StorageBufferSet buffers;
+    small_vector<PointerArray, 2> arrays;
+};
+
 struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
@@ -75,7 +111,13 @@ struct StorageInfo {
     /// instructions (the IR does not change while storage buffers are collected).
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> biased_tracks;
     std::unordered_map<const IR::Inst*, std::optional<StorageBufferAddr>> unbiased_tracks;
-    std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
+    /// Instructions from which a search with (or without) the bias cannot succeed, so later
+    /// searches from other addresses skip what failed ones walked.
+    std::unordered_set<const IR::Inst*> biased_exhausted;
+    std::unordered_set<const IR::Inst*> unbiased_exhausted;
+    std::unordered_map<const IR::Inst*, NativeCandidates> native_candidates;
+    /// Accesses left global whose candidates are complete and all bound
+    std::vector<RoutedAccess> routed;
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
     /// A native access with several candidate pointers was left global.
@@ -96,6 +138,10 @@ struct StorageInfo {
     /// from table_budget, which they were left out of.
     StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
+    /// Buffers a store or atomic that stayed global may write to (at run time, at any offset)
+    StorageBufferSet unbounded_writes;
+    /// A store or atomic stayed global without a buffer: it may land in any written buffer
+    bool untracked_writes{};
 };
 
 /// Returns true when the instruction is a global memory instruction
@@ -399,7 +445,8 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
 }
 
 /// Tries to track the storage buffer address used by a global memory instruction
-std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias) {
+std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
+                                       std::unordered_set<const IR::Inst*>& exhausted) {
     const auto pred{[bias](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 &&
             inst->GetOpcode() != IR::Opcode::GetCbufU32x2) {
@@ -440,7 +487,7 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
         }
         return operand;
     };
-    return BreadthFirstSearch(value, pred, stop_at_memory);
+    return BreadthFirstSearchPruned(value, pred, exhausted, stop_at_memory);
 }
 
 /// Finds the one constant buffer word added directly into the low address, which is the base
@@ -448,25 +495,29 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
 std::optional<StorageBufferAddr> TrackAddend(const IR::Value& value) {
     std::optional<StorageBufferAddr> result;
     bool ambiguous{};
-    const auto visit{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    // Explicit stack, not recursion: a long IAdd32 chain would take one host frame per addition
+    // (the same overflow as CollectIteratorWords). Pushing Arg(1) first keeps Arg(0) first.
+    std::vector<IR::Value> pending{value};
+    while (!pending.empty() && !ambiguous) {
+        const IR::Value term{pending.back()};
+        pending.pop_back();
+        if (term.IsImmediate()) {
+            continue;
         }
         const IR::Inst* const inst{term.InstRecursive()};
         if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+            pending.push_back(inst->Arg(1));
+            pending.push_back(inst->Arg(0));
+            continue;
         }
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
             !inst->Arg(1).IsImmediate() || !Common::IsAligned(inst->Arg(1).U32(), 8)) {
-            return;
+            continue;
         }
         const StorageBufferAddr found{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
         ambiguous = result.has_value();
         result = found;
-    }};
-    visit(visit, value);
+    }
     return ambiguous ? std::nullopt : result;
 }
 
@@ -856,61 +907,80 @@ StorageBufferSet CollectIteratorWords(IR::Program& program) {
     std::unordered_set<const IR::Inst*> on_stack;
     std::vector<const IR::Inst*> stack;
     u32 next_index{};
-    const auto visit = [&](auto&& self, const IR::Inst* inst) -> void {
-        if (indices.contains(inst)) {
-            return;
-        }
+    struct VisitFrame {
+        const IR::Inst* inst;
+        size_t next_arg;
+    };
+    std::vector<VisitFrame> pending;
+    const auto enter = [&](const IR::Inst* inst) {
         const u32 index = next_index++;
         indices[inst] = lowlinks[inst] = index;
         stack.push_back(inst);
         on_stack.insert(inst);
-        const auto op = inst->GetOpcode();
-        if (op == IR::Opcode::IAdd32 || op == IR::Opcode::Phi || op == IR::Opcode::SelectU32) {
-            for (size_t arg = op == IR::Opcode::SelectU32 ? 1 : 0; arg < inst->NumArgs(); ++arg) {
-                if (inst->Arg(arg).IsImmediate()) {
+        pending.push_back({inst, inst->GetOpcode() == IR::Opcode::SelectU32 ? 1U : 0U});
+    };
+    const auto visit = [&](const IR::Inst* root) {
+        if (indices.contains(root)) {
+            return;
+        }
+        enter(root);
+        while (!pending.empty()) {
+            auto& frame = pending.back();
+            const IR::Inst* inst = frame.inst;
+            const auto op = inst->GetOpcode();
+            const bool follows_args = op == IR::Opcode::IAdd32 || op == IR::Opcode::Phi ||
+                                      op == IR::Opcode::SelectU32;
+            if (follows_args && frame.next_arg < inst->NumArgs()) {
+                const auto& arg = inst->Arg(frame.next_arg++);
+                if (arg.IsImmediate()) {
                     continue;
                 }
-                const IR::Inst* next = inst->Arg(arg).InstRecursive();
+                const IR::Inst* next = arg.InstRecursive();
                 if (!indices.contains(next)) {
-                    self(self, next);
-                    lowlinks[inst] = std::min(lowlinks[inst], lowlinks[next]);
+                    enter(next);
                 } else if (on_stack.contains(next)) {
                     lowlinks[inst] = std::min(lowlinks[inst], indices[next]);
                 }
-            }
-        }
-        if (lowlinks[inst] != index) {
-            return;
-        }
-        std::vector<const IR::Inst*> component;
-        const IR::Inst* member;
-        do {
-            member = stack.back();
-            stack.pop_back();
-            on_stack.erase(member);
-            component.push_back(member);
-        } while (member != inst);
-        if (component.size() < 2) {
-            return;
-        }
-        const std::unordered_set<const IR::Inst*> members(component.begin(), component.end());
-        for (const IR::Inst* add : component) {
-            if (add->GetOpcode() != IR::Opcode::IAdd32) {
                 continue;
             }
-            for (size_t arg = 0; arg < add->NumArgs(); ++arg) {
-                const auto& term = add->Arg(arg);
-                if (!term.IsImmediate() && members.contains(term.InstRecursive())) {
+            pending.pop_back();
+            if (!pending.empty()) {
+                const IR::Inst* parent = pending.back().inst;
+                lowlinks[parent] = std::min(lowlinks[parent], lowlinks[inst]);
+            }
+            if (lowlinks[inst] != indices[inst]) {
+                continue;
+            }
+            std::vector<const IR::Inst*> component;
+            const IR::Inst* member;
+            do {
+                member = stack.back();
+                stack.pop_back();
+                on_stack.erase(member);
+                component.push_back(member);
+            } while (member != inst);
+            if (component.size() < 2) {
+                continue;
+            }
+            const std::unordered_set<const IR::Inst*> members(component.begin(), component.end());
+            for (const IR::Inst* add : component) {
+                if (add->GetOpcode() != IR::Opcode::IAdd32) {
                     continue;
                 }
-                ForEachSummedWord(term, [&](StorageBufferAddr word, u32) { result.insert(word); });
+                for (size_t arg = 0; arg < add->NumArgs(); ++arg) {
+                    const auto& term = add->Arg(arg);
+                    if (!term.IsImmediate() && members.contains(term.InstRecursive())) {
+                        continue;
+                    }
+                    ForEachSummedWord(term, [&](StorageBufferAddr word, u32) { result.insert(word); });
+                }
             }
         }
     };
     for (IR::Block* block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() == IR::Opcode::Phi) {
-                visit(visit, &inst);
+                visit(&inst);
             }
         }
     }
@@ -1085,37 +1155,40 @@ std::optional<std::pair<u32, u32>> DynamicPointerSlots(const IR::Value& offset) 
 }
 
 /// Slots of a pointer array read at a dynamic offset, following phis and selects of the offset.
-/// A stride of zero is a single slot.
-void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u32>, 4>& slots,
+/// A stride of zero is a single slot. Returns false when a path of the offset matches no slot
+/// pattern.
+bool CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u32>, 4>& slots,
                          std::unordered_set<const IR::Inst*>& visited) {
     if (offset.IsImmediate()) {
         if (std::ranges::find(slots, std::pair{offset.U32(), 0U}) == slots.end()) {
             slots.emplace_back(offset.U32(), 0U);
         }
-        return;
+        return true;
     }
     const IR::Inst* const inst{offset.InstRecursive()};
     if (!visited.insert(inst).second) {
-        return;
+        return true;
     }
     if (const auto pattern{DynamicPointerSlots(offset)}) {
         if (std::ranges::find(slots, *pattern) == slots.end()) {
             slots.push_back(*pattern);
         }
-        return;
+        return true;
     }
     switch (inst->GetOpcode()) {
-    case IR::Opcode::Phi:
+    case IR::Opcode::Phi: {
+        bool complete{true};
         for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-            CollectPointerSlots(inst->Arg(arg), slots, visited);
+            complete &= CollectPointerSlots(inst->Arg(arg), slots, visited);
         }
-        break;
-    case IR::Opcode::SelectU32:
-        CollectPointerSlots(inst->Arg(1), slots, visited);
-        CollectPointerSlots(inst->Arg(2), slots, visited);
-        break;
+        return complete;
+    }
+    case IR::Opcode::SelectU32: {
+        const bool lhs{CollectPointerSlots(inst->Arg(1), slots, visited)};
+        return CollectPointerSlots(inst->Arg(2), slots, visited) && lhs;
+    }
     default:
-        break;
+        return false;
     }
 }
 
@@ -1123,10 +1196,60 @@ void CollectPointerSlots(const IR::Value& offset, small_vector<std::pair<u32, u3
 /// additions, selects and phis. A predicated address assignment becomes a phi whose other input
 /// can point into a different buffer, so the search does not stop at the first pointer. A pointer
 /// read from an array at a dynamic offset contributes every mapped slot of the array.
-small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_addr,
-                                                           Environment& env, bool& dynamic,
-                                                           StorageInfo& info) {
-    small_vector<StorageBufferAddr, 4> candidates;
+NativeCandidates NativePointerCandidates(const IR::U32& low_addr, Environment& env, bool& dynamic,
+                                         StorageInfo& info, const TrackingConditions& conditions) {
+    NativeCandidates result;
+    auto& candidates{result.pointers};
+    // Whether each pointer source the search reached (a constant buffer read or a table load)
+    // gave its pointers: a missing entry is one that did not.
+    std::unordered_map<const IR::Inst*, bool> sources;
+    // Table loads whose pointer reaches the address from another iteration (a loop back edge) or
+    // another lane (a shuffle): the access's conditions say nothing about their table pointer.
+    std::unordered_set<const IR::Inst*> foreign_loads;
+    {
+        std::deque<std::pair<const IR::Inst*, bool>> queue{{low_addr.InstRecursive(), false}};
+        std::array<std::unordered_set<const IR::Inst*>, 2> seen;
+        while (!queue.empty()) {
+            const auto [inst, foreign] = queue.front();
+            queue.pop_front();
+            if (!seen[foreign].insert(inst).second) {
+                continue;
+            }
+            const auto follow = [&](const IR::Value& value, bool next_foreign) {
+                if (!value.IsImmediate()) {
+                    queue.emplace_back(value.InstRecursive(), next_foreign);
+                }
+            };
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::Phi:
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    follow(inst->Arg(arg), foreign || (inst->GetOpcode() == IR::Opcode::Phi &&
+                                                       conditions.IsBackEdge(inst, arg)));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                follow(inst->Arg(1), foreign);
+                follow(inst->Arg(2), foreign);
+                break;
+            case IR::Opcode::ShuffleIndex:
+                follow(inst->Arg(0), true);
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
+                    follow(inst->Arg(0), foreign);
+                }
+                break;
+            case IR::Opcode::LoadGlobal64:
+                if (foreign) {
+                    foreign_loads.insert(inst);
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
     const auto enqueue = [&](const IR::Value& value) {
@@ -1145,30 +1268,37 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 static constexpr u32 max_slots{16};
                 small_vector<std::pair<u32, u32>, 4> slots;
                 std::unordered_set<const IR::Inst*> slot_visited;
-                CollectPointerSlots(offset, slots, slot_visited);
+                const bool complete{CollectPointerSlots(offset, slots, slot_visited) &&
+                                    !slots.empty()};
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        result.arrays.push_back(
+                            {.first{.index = index.U32(), .offset = first}, .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            !ContainsAddr(candidates, pointer) &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
                         }
                     }
                 }
+                sources.emplace(inst, complete);
                 break;
             }
             if (!index.IsImmediate() || !offset.IsImmediate()) {
                 break;
             }
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
-            if (Common::IsAligned(pointer.offset, 8) &&
-                std::ranges::find(candidates, pointer) == candidates.end() &&
-                env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
+            const bool is_pointer{Common::IsAligned(pointer.offset, 8) &&
+                                  env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)};
+            if (is_pointer && !ContainsAddr(candidates, pointer)) {
                 candidates.push_back(pointer);
             }
+            sources.emplace(inst, is_pointer);
             break;
         }
         case IR::Opcode::IAdd32:
@@ -1223,53 +1353,86 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 break;
             }
             const u32 indirect{static_cast<u32>(holder_offset)};
+            bool table_complete{true};
             // The table pointer can also be one of several constant buffer pointers (a phi or
             // select of them), or an entry of a constant buffer array indexed at run time (one
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                if (ContainsAddr(candidates, pointer)) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
                     // Graphics programs bind every candidate for every draw: table entries
                     // multiply the storage buffers of draws that never read them.
+                    table_complete = false;
                     return;
                 }
                 if (table) {
                     info.tables_seen = true;
                     if (!info.tables_enabled) {
+                        table_complete = false;
                         return;
                     }
-                    if (std::ranges::find(info.table_candidates, pointer) ==
-                        info.table_candidates.end()) {
+                    if (!ContainsAddr(info.table_candidates, pointer)) {
                         info.table_candidates.push_back(pointer);
                     }
                 }
                 candidates.push_back(pointer);
                 dynamic = true;
             };
-            small_vector<std::pair<const IR::Inst*, bool>, 4> holders{{holder_root, false}};
-            std::unordered_set<const IR::Inst*> holder_visited{holder_root};
+            // Each holder, whether it was reached through a phi or select, and whether its value
+            // can come from another iteration or lane
+            small_vector<std::tuple<const IR::Inst*, bool, bool>, 4> holders{
+                {holder_root, false, foreign_loads.contains(inst)}};
+            std::array<std::unordered_set<const IR::Inst*>, 2> holder_visited;
+            holder_visited[std::get<2>(holders.front())].insert(holder_root);
             for (size_t pending_holder = 0; pending_holder < holders.size(); ++pending_holder) {
-                const auto [holder, via_phi] = holders[pending_holder];
-                const auto enqueue_holder = [&](const IR::Value& value, bool branch) {
-                    if (!value.IsImmediate() && holders.size() < 8 &&
-                        holder_visited.insert(value.InstRecursive()).second) {
-                        holders.emplace_back(value.InstRecursive(), via_phi || branch);
+                const auto [holder, via_phi, foreign] = holders[pending_holder];
+                const auto enqueue_holder = [&](const IR::Value& value, bool branch,
+                                                bool back_edge = false) {
+                    const bool next_foreign{foreign || back_edge};
+                    if (value.IsImmediate() ||
+                        (holders.size() >= 8 &&
+                         !holder_visited[next_foreign].contains(value.InstRecursive()))) {
+                        table_complete = false;
+                        return;
+                    }
+                    if (holder_visited[next_foreign].insert(value.InstRecursive()).second) {
+                        holders.emplace_back(value.InstRecursive(), via_phi || branch,
+                                             next_foreign);
                     }
                 };
                 switch (holder->GetOpcode()) {
                 case IR::Opcode::CompositeExtractU32x2:
                     if (holder->Arg(1).IsImmediate() && holder->Arg(1).U32() == 0) {
                         enqueue_holder(holder->Arg(0), false);
+                    } else {
+                        table_complete = false;
                     }
                     continue;
-                case IR::Opcode::Phi:
+                case IR::Opcode::Phi: {
+                    // A predicated table pointer assignment: the input of the path that skips it
+                    // cannot reach an access under the same predicate.
+                    small_vector<size_t, 4> feasible;
                     for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
-                        enqueue_holder(holder->Arg(arg), true);
+                        if (foreign || conditions.AllowsPhi(holder, arg)) {
+                            feasible.push_back(arg);
+                        }
+                    }
+                    if (feasible.empty()) {
+                        for (size_t arg = 0; arg < holder->NumArgs(); ++arg) {
+                            feasible.push_back(arg);
+                        }
+                    } else if (feasible.size() < holder->NumArgs()) {
+                        result.pruned_at = conditions.current;
+                    }
+                    for (const size_t arg : feasible) {
+                        enqueue_holder(holder->Arg(arg), feasible.size() > 1,
+                                       conditions.IsBackEdge(holder, arg));
                     }
                     continue;
+                }
                 case IR::Opcode::SelectU32:
                     enqueue_holder(holder->Arg(1), true);
                     enqueue_holder(holder->Arg(2), true);
@@ -1278,9 +1441,11 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 case IR::Opcode::GetCbufU32x2:
                     break;
                 default:
+                    table_complete = false;
                     continue;
                 }
                 if (!holder->Arg(0).IsImmediate()) {
+                    table_complete = false;
                     continue;
                 }
                 const u32 index{holder->Arg(0).U32()};
@@ -1290,14 +1455,22 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     if (Common::IsAligned(pointer.offset, 8) &&
                         env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                         add(pointer, via_phi || !holder_addr);
+                    } else {
+                        table_complete = false;
                     }
                     continue;
                 }
                 static constexpr u32 max_slots{16};
                 small_vector<std::pair<u32, u32>, 4> slots;
                 std::unordered_set<const IR::Inst*> slot_visited;
-                CollectPointerSlots(holder->Arg(1), slots, slot_visited);
+                table_complete &=
+                    CollectPointerSlots(holder->Arg(1), slots, slot_visited) && !slots.empty();
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        result.arrays.push_back(
+                            {.first{.index = index, .offset = first, .indirect = indirect},
+                             .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{
                             .index = index, .offset = first + slot * stride, .indirect = indirect};
@@ -1309,17 +1482,66 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     }
                 }
             }
+            sources.emplace(inst, table_complete);
             break;
         }
         default:
             break;
         }
     }
-    return candidates;
+    // The pointer is in one input of an addition (the others are offsets), in every input of a phi
+    // or select. A greatest fixed point: a phi reached again through a loop is complete when the
+    // values entering the loop are.
+    std::unordered_map<const IR::Inst*, bool> complete;
+    for (const IR::Inst* const inst : pending) {
+        complete.emplace(inst, true);
+    }
+    const auto is_complete = [&](const IR::Value& value) {
+        return !value.IsImmediate() && complete.at(value.InstRecursive());
+    };
+    for (bool changed{true}; changed;) {
+        changed = false;
+        for (const IR::Inst* const inst : pending) {
+            bool value{};
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+                value = is_complete(inst->Arg(0)) || is_complete(inst->Arg(1));
+                break;
+            case IR::Opcode::Phi:
+                value = true;
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    value &= is_complete(inst->Arg(arg));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                value = is_complete(inst->Arg(1)) && is_complete(inst->Arg(2));
+                break;
+            case IR::Opcode::ShuffleIndex:
+                value = is_complete(inst->Arg(0));
+                break;
+            case IR::Opcode::CompositeExtractU32x2:
+                value = inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0 &&
+                        is_complete(inst->Arg(0));
+                break;
+            default: {
+                const auto source{sources.find(inst)};
+                value = source != sources.end() && source->second;
+                break;
+            }
+            }
+            if (value != complete[inst]) {
+                complete[inst] = value;
+                changed = true;
+            }
+        }
+    }
+    result.complete = complete.at(low_addr.InstRecursive());
+    return result;
 }
 
-/// Collects the storage buffer used by a global memory instruction and the instruction itself
-void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env,
+/// Collects the storage buffer used by a global memory instruction and the instruction itself.
+/// Returns false when the access stays global without a buffer.
+bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env,
                            const TrackingConditions& conditions) {
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
     // avoid getting false positives
@@ -1333,7 +1555,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const std::optional<LowAddrInfo> low_addr_info{TrackLowAddress(&inst)};
     if (!low_addr_info) {
         // Failed to track the low address, use NVN fallbacks
-        return;
+        return false;
     }
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
@@ -1353,16 +1575,23 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
+        if (it != info.native_candidates.end() && it->second.pruned_at &&
+            it->second.pruned_at != conditions.current) {
+            // Searched for an access in another block, whose conditions left other inputs out
+            info.native_candidates.erase(it);
+            it = info.native_candidates.end();
+        }
         if (it == info.native_candidates.end()) {
             bool dynamic{};
             it = info.native_candidates
-                     .emplace(start, NativePointerCandidates(low_addr, env, dynamic, info))
+                     .emplace(start,
+                              NativePointerCandidates(low_addr, env, dynamic, info, conditions))
                      .first;
             if (dynamic) {
                 info.native_dynamic.insert(start);
             }
         }
-        const auto& candidates{it->second};
+        const auto& candidates{it->second.pointers};
         const bool has_loaded_pointer{std::ranges::any_of(
             candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
         if (paired_found &&
@@ -1374,17 +1603,20 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
+            // Its own buffers, routed among alone when the candidates are complete and all bound
+            RoutedAccess routed{.inst = &inst, .arrays = it->second.arrays};
+            bool all_bound{it->second.complete};
             if (paired_found) {
                 // The paired pointer is the other input of the select or phi; bind it too.
                 info.competing_loaded_bound = true;
                 info.set.insert(*storage_buffer);
+                routed.buffers.insert(*storage_buffer);
                 if (IsGlobalMemoryWrite(inst)) {
                     info.writes.insert(*storage_buffer);
                 }
             }
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find(info.table_candidates, candidate) !=
-                    info.table_candidates.end()) {
+                if (ContainsAddr(info.table_candidates, candidate)) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
                     const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
@@ -1395,13 +1627,16 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                         (takes_binding(candidate) ? 1U : 0U) +
                         (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
+                        all_bound = false;
                         continue;
                     }
                     info.table_used += added;
                 }
                 info.set.insert(candidate);
+                routed.buffers.insert(candidate);
                 if (IsGlobalMemoryWrite(inst)) {
                     info.writes.insert(candidate);
+                    info.unbounded_writes.insert(candidate);
                 }
                 if (candidate.indirect != ~0U) {
                     // The backend reads the pointer through the buffer that holds it.
@@ -1412,7 +1647,10 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             }
             if (accepted) {
                 info.native_runtime_bounds = true;
-                return;
+                if (all_bound) {
+                    info.routed.push_back(std::move(routed));
+                }
+                return true;
             }
             // Only table entries, and no free binding for them: as if none had been found.
         } else if (candidates.size() == 1 && !paired_found) {
@@ -1428,19 +1666,19 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         // them were unmapped when their pipelines were first built. The binding reads the pointer
         // again for every dispatch.
         if (!paired_pointer || !info.atomic_pointers.contains(*paired_pointer)) {
-            return;
+            return false;
         }
         storage_buffer = paired_pointer;
     }
-    const auto cached_track = [&](const Bias* bias, auto& cache) {
+    const auto cached_track = [&](const Bias* bias, auto& cache, auto& exhausted) {
         if (low_addr.IsImmediate()) {
-            return Track(low_addr, bias);
+            return Track(low_addr, bias, exhausted);
         }
         const IR::Inst* const start{low_addr.InstRecursive()};
         if (const auto it = cache.find(start); it != cache.end()) {
             return it->second;
         }
-        const std::optional<StorageBufferAddr> result{Track(low_addr, bias)};
+        const std::optional<StorageBufferAddr> result{Track(low_addr, bias, exhausted)};
         cache.emplace(start, result);
         return result;
     };
@@ -1451,15 +1689,15 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         storage_buffer = TrackAddend(low_addr);
     }
     if (!storage_buffer) {
-        storage_buffer = cached_track(&nvn_bias, info.biased_tracks);
+        storage_buffer = cached_track(&nvn_bias, info.biased_tracks, info.biased_exhausted);
     }
     if (!storage_buffer) {
         // If it fails, track without a bias
-        storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        storage_buffer = cached_track(nullptr, info.unbiased_tracks, info.unbiased_exhausted);
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
-            return;
+            return false;
         }
         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",
                     storage_buffer->index, storage_buffer->offset);
@@ -1474,7 +1712,473 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         .inst = &inst,
         .block = &block,
     });
+    return true;
 }
+
+/// Bytes a global store or atomic writes
+u32 StoreSize(IR::Opcode opcode) {
+    switch (opcode) {
+    case IR::Opcode::WriteGlobalS8:
+    case IR::Opcode::WriteGlobalU8:
+        return 1;
+    case IR::Opcode::WriteGlobalS16:
+    case IR::Opcode::WriteGlobalU16:
+        return 2;
+    case IR::Opcode::WriteGlobal64:
+    case IR::Opcode::GlobalAtomicIAdd64:
+    case IR::Opcode::GlobalAtomicSMin64:
+    case IR::Opcode::GlobalAtomicUMin64:
+    case IR::Opcode::GlobalAtomicSMax64:
+    case IR::Opcode::GlobalAtomicUMax64:
+    case IR::Opcode::GlobalAtomicAnd64:
+    case IR::Opcode::GlobalAtomicOr64:
+    case IR::Opcode::GlobalAtomicXor64:
+    case IR::Opcode::GlobalAtomicExchange64:
+    case IR::Opcode::GlobalAtomicIAdd32x2:
+    case IR::Opcode::GlobalAtomicSMin32x2:
+    case IR::Opcode::GlobalAtomicUMin32x2:
+    case IR::Opcode::GlobalAtomicSMax32x2:
+    case IR::Opcode::GlobalAtomicUMax32x2:
+    case IR::Opcode::GlobalAtomicAnd32x2:
+    case IR::Opcode::GlobalAtomicOr32x2:
+    case IR::Opcode::GlobalAtomicXor32x2:
+    case IR::Opcode::GlobalAtomicExchange32x2:
+    case IR::Opcode::GlobalAtomicAddF32x2:
+    case IR::Opcode::GlobalAtomicMinF32x2:
+    case IR::Opcode::GlobalAtomicMaxF32x2:
+        return 8;
+    case IR::Opcode::WriteGlobal128:
+        return 16;
+    default:
+        return 4;
+    }
+}
+
+/// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
+/// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
+/// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
+/// bound is largest at the largest ids.
+/// An exact bound is the value itself modulo 2^32, so a negative c means the value can wrap below
+/// zero and is no bound for an unsigned operation. An inexact bound (a select, mask, shift or field
+/// extract) is only an upper bound, with c >= 0: subtracting from it or scaling a value that can
+/// wrap by it can wrap too, so those leave the value unknown.
+struct IdBound {
+    s64 c{};
+    std::array<u64, 6> coef{};
+    u32 base{};
+    bool exact{true};
+
+    bool IsConstant() const {
+        return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
+    }
+    bool HasGroupTerms() const {
+        return coef[3] != 0 || coef[4] != 0 || coef[5] != 0;
+    }
+};
+
+/// Proves where a program's stores to one storage buffer can land relative to its pointer word.
+/// Anything not provably affine in the invocation and workgroup ids with constant non-negative
+/// strides (a value loaded from memory or read from another constant buffer word, a loop-carried
+/// index, a signed or 64-bit computation) leaves the extent unknown.
+class StoreExtentAnalysis {
+public:
+    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
+        : buffer{buffer_}, workgroup{workgroup_} {}
+
+    /// Extent of one store, merged into `extent`
+    void AddStore(IR::Inst& inst, StorageWriteExtent& extent) {
+        const std::optional<StorageWriteExtent> store{StoreExtent(inst)};
+        if (!store) {
+            extent = StorageWriteExtent{};
+            return;
+        }
+        MergeStorageWriteExtent(extent, *store);
+    }
+
+private:
+    static constexpr s64 CONST_LIMIT = s64{1} << 40;
+    static constexpr u64 COEF_LIMIT = u64{1} << 32;
+    static constexpr u32 MAX_DEPTH = 256;
+
+    std::optional<StorageWriteExtent> StoreExtent(IR::Inst& inst) {
+        const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
+        if (!addr) {
+            return std::nullopt;
+        }
+        const std::optional<IdBound> low{Evaluate(addr->value, 0)};
+        if (!low || low->base != 1 || guard_failed) {
+            return std::nullopt;
+        }
+        // Below zero, invocation 0's offset wraps modulo 2^32 (see IdBound).
+        const s64 start{low->c + addr->imm_offset};
+        const s64 end{start + StoreSize(inst.GetOpcode())};
+        if (start < 0 || end > s64{0xffffffff}) {
+            return std::nullopt;
+        }
+        StorageWriteExtent result{
+            .bounded = true,
+            .const_end = static_cast<u32>(end),
+        };
+        for (size_t i = 0; i < 3; ++i) {
+            if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
+                return std::nullopt;
+            }
+            result.local_stride[i] = static_cast<u32>(low->coef[i]);
+            result.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
+        }
+        if (guard) {
+            if (guard->c > s64{0xffff}) {
+                return std::nullopt;
+            }
+            result.guarded = true;
+            result.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
+            for (size_t i = 0; i < 3; ++i) {
+                if (guard->coef[i] > 0xffff || guard->coef[i + 3] > 0xffff) {
+                    return std::nullopt;
+                }
+                result.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
+                result.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
+            }
+        }
+        return result;
+    }
+
+    static std::optional<IdBound> Checked(IdBound value) {
+        if (value.c > CONST_LIMIT || value.c < -CONST_LIMIT || value.base > 1) {
+            return std::nullopt;
+        }
+        for (const u64 coef : value.coef) {
+            if (coef >= COEF_LIMIT) {
+                return std::nullopt;
+            }
+        }
+        return value;
+    }
+
+    static std::optional<IdBound> Constant(s64 value) {
+        return IdBound{.c = value};
+    }
+
+    static std::optional<IdBound> Inexact(IdBound value) {
+        value.exact = false;
+        return value;
+    }
+
+    static std::optional<IdBound> Sum(const IdBound& lhs, const IdBound& rhs) {
+        // An upper bound minus a constant: the value itself can be below the constant
+        if ((!lhs.exact && rhs.c < 0) || (!rhs.exact && lhs.c < 0)) {
+            return std::nullopt;
+        }
+        IdBound result{
+            .c = lhs.c + rhs.c, .base = lhs.base + rhs.base, .exact = lhs.exact && rhs.exact};
+        for (size_t i = 0; i < result.coef.size(); ++i) {
+            result.coef[i] = lhs.coef[i] + rhs.coef[i];
+        }
+        return Checked(result);
+    }
+
+    /// Component-wise maximum: a bound of either value (ids are non-negative). A value that can
+    /// wrap below zero is larger than any bound of the other.
+    static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
+        if (lhs.base != rhs.base || lhs.c < 0 || rhs.c < 0) {
+            return std::nullopt;
+        }
+        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base, .exact = false};
+        for (size_t i = 0; i < result.coef.size(); ++i) {
+            result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
+        }
+        return result;
+    }
+
+    /// value * factor, where an inexact factor only bounds the multiplier: then the value must not
+    /// wrap below zero
+    static std::optional<IdBound> Scale(const IdBound& value, u64 factor,
+                                        bool exact_factor = true) {
+        if (value.base != 0 || factor >= COEF_LIMIT || (!exact_factor && value.c < 0)) {
+            return std::nullopt;
+        }
+        // Before multiplying: |c| is at most 2^40 and the factor below 2^32, so the product can
+        // overflow 64 bits (either sign)
+        const u64 magnitude{static_cast<u64>(value.c < 0 ? -value.c : value.c)};
+        if (magnitude != 0 && factor > static_cast<u64>(CONST_LIMIT) / magnitude) {
+            return std::nullopt;
+        }
+        IdBound result{.c = value.c * static_cast<s64>(factor),
+                       .exact = value.exact && exact_factor};
+        for (size_t i = 0; i < result.coef.size(); ++i) {
+            if (value.coef[i] != 0 && factor > (COEF_LIMIT - 1) / value.coef[i]) {
+                return std::nullopt;
+            }
+            result.coef[i] = value.coef[i] * factor;
+        }
+        return Checked(result);
+    }
+
+    /// value >> shift, rounded up term by term (the sum of the rounded terms bounds the shifted sum)
+    static std::optional<IdBound> ShiftDown(const IdBound& value, u32 shift) {
+        if (value.base != 0 || value.c < 0 || shift >= 32) {
+            return std::nullopt;
+        }
+        const auto up = [shift](u64 x) { return (x + (u64{1} << shift) - 1) >> shift; };
+        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c))), .exact = false};
+        for (size_t i = 0; i < result.coef.size(); ++i) {
+            result.coef[i] = up(value.coef[i]);
+        }
+        return result;
+    }
+
+    /// The value's bound when only its local-id terms vary (the workgroup size is fixed), or
+    /// nullopt when it has workgroup terms or the pointer
+    std::optional<u64> StaticMax(const IdBound& value) const {
+        if (value.base != 0 || value.HasGroupTerms() || value.c < 0) {
+            return std::nullopt;
+        }
+        u64 total{static_cast<u64>(value.c)};
+        for (size_t i = 0; i < 3; ++i) {
+            if (workgroup[i] == 0) {
+                return std::nullopt;
+            }
+            total += value.coef[i] * (workgroup[i] - 1);
+        }
+        return total;
+    }
+
+    /// Requires a value to stay below 2^16 for the bound to hold
+    void Guard(const IdBound& value) {
+        if (value.base != 0 || value.c < 0) {
+            guard_failed = true;
+            return;
+        }
+        if (!guard) {
+            guard = value;
+            return;
+        }
+        const std::optional<IdBound> merged{Max(*guard, value)};
+        if (!merged) {
+            guard_failed = true;
+            return;
+        }
+        guard = *merged;
+    }
+
+    std::optional<IdBound> BitFieldExtract(const IR::Inst& inst, u32 depth) {
+        if (!inst.Arg(1).IsImmediate() || !inst.Arg(2).IsImmediate()) {
+            return std::nullopt;
+        }
+        const u32 offset{inst.Arg(1).U32()};
+        const u32 count{inst.Arg(2).U32()};
+        if (offset >= 32 || count == 0 || count > 32) {
+            return std::nullopt;
+        }
+        if (inst.Arg(0).IsImmediate()) {
+            const u64 field{(u64{inst.Arg(0).U32()} >> offset) & ((u64{1} << count) - 1)};
+            return Constant(static_cast<s64>(field));
+        }
+        const std::optional<IdBound> source{Evaluate(inst.Arg(0), depth + 1)};
+        const std::optional<IdBound> field_max{
+            count <= 24 ? Inexact(IdBound{.c = (s64{1} << count) - 1}) : std::nullopt};
+        if (!source || source->base != 0 || source->c < 0) {
+            return field_max;
+        }
+        if (const std::optional<u64> static_max{StaticMax(*source)}) {
+            if (offset < 64 && (*static_max >> offset) == 0) {
+                return Constant(0);
+            }
+        }
+        if (offset == 0) {
+            // A low field is at most the whole value
+            return count == 32 ? source : Inexact(*source);
+        }
+        if (offset >= 16) {
+            // The high half of a lowered 32-bit multiplication's operand: zero while the operand
+            // stays below 2^16, which the dispatch checks
+            Guard(*source);
+            return Constant(0);
+        }
+        return ShiftDown(*source, offset);
+    }
+
+    std::optional<IdBound> Evaluate(const IR::Value& value, u32 depth) {
+        if (value.IsImmediate()) {
+            if (value.Type() != IR::Type::U32) {
+                return std::nullopt;
+            }
+            return Constant(static_cast<s64>(static_cast<s32>(value.U32())));
+        }
+        if (depth > MAX_DEPTH) {
+            return std::nullopt;
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (const auto it{memo.find(inst)}; it != memo.end()) {
+            return it->second;
+        }
+        if (!active.insert(inst).second) {
+            // A cycle: a loop-carried value
+            return std::nullopt;
+        }
+        const std::optional<IdBound> result{EvaluateInst(*inst, depth)};
+        active.erase(inst);
+        memo.emplace(inst, result);
+        return result;
+    }
+
+    std::optional<IdBound> EvaluateInst(const IR::Inst& inst, u32 depth) {
+        if (const std::optional<StorageBufferAddr> word{CbufWord(&inst)}) {
+            if (*word == buffer) {
+                return IdBound{.base = 1};
+            }
+            return std::nullopt;
+        }
+        const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::CompositeExtractU32x3: {
+            if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() > 2) {
+                return std::nullopt;
+            }
+            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
+            const u32 element{inst.Arg(1).U32()};
+            IdBound result;
+            if (vector == IR::Opcode::LocalInvocationId) {
+                result.coef[element] = 1;
+            } else if (vector == IR::Opcode::WorkgroupId) {
+                result.coef[3 + element] = 1;
+            } else {
+                return std::nullopt;
+            }
+            return result;
+        }
+        case IR::Opcode::IAdd32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            return lhs && rhs ? Sum(*lhs, *rhs) : std::nullopt;
+        }
+        case IR::Opcode::ISub32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            // Subtracting a bound of the subtrahend bounds nothing
+            if (!lhs || !rhs || !rhs->IsConstant() || !rhs->exact) {
+                return std::nullopt;
+            }
+            return Sum(*lhs, IdBound{.c = -rhs->c});
+        }
+        case IR::Opcode::IMul32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            if (rhs->IsConstant() && rhs->c >= 0) {
+                return Scale(*lhs, static_cast<u64>(rhs->c), rhs->exact);
+            }
+            if (lhs->IsConstant() && lhs->c >= 0) {
+                return Scale(*rhs, static_cast<u64>(lhs->c), lhs->exact);
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::ShiftLeftLogical32: {
+            if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32) {
+                return std::nullopt;
+            }
+            const auto lhs{arg(0)};
+            return lhs ? Scale(*lhs, u64{1} << inst.Arg(1).U32()) : std::nullopt;
+        }
+        case IR::Opcode::ShiftRightLogical32: {
+            if (!inst.Arg(1).IsImmediate()) {
+                return std::nullopt;
+            }
+            const auto lhs{arg(0)};
+            return lhs ? ShiftDown(*lhs, inst.Arg(1).U32()) : std::nullopt;
+        }
+        case IR::Opcode::BitwiseAnd32: {
+            // x & y <= min(x, y) for unsigned values
+            const auto lhs{arg(0)};
+            const auto rhs{arg(1)};
+            const auto usable{[](const std::optional<IdBound>& bound) {
+                return bound && bound->base == 0 && bound->c >= 0;
+            }};
+            for (const auto* side : {&rhs, &lhs}) {
+                if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
+                    return Inexact(**side);
+                }
+            }
+            for (const auto* side : {&lhs, &rhs}) {
+                if (usable(*side)) {
+                    return Inexact(**side);
+                }
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::BitwiseOr32:
+        case IR::Opcode::BitwiseXor32:
+        case IR::Opcode::UMax32: {
+            // x | y, x ^ y and max(x, y) are at most x + y for unsigned values
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs || lhs->base != 0 || rhs->base != 0 || lhs->c < 0 || rhs->c < 0) {
+                return std::nullopt;
+            }
+            const auto sum{Sum(*lhs, *rhs)};
+            return sum ? Inexact(*sum) : std::nullopt;
+        }
+        case IR::Opcode::UMin32: {
+            const auto lhs{arg(0)};
+            const auto rhs{arg(1)};
+            for (const auto* side : {&rhs, &lhs}) {
+                if (*side && (*side)->base == 0 && (*side)->c >= 0) {
+                    return Inexact(**side);
+                }
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::BitFieldUExtract:
+            return BitFieldExtract(inst, depth);
+        case IR::Opcode::BitFieldInsert: {
+            // (base & ~mask) | ((insert << offset) & mask) <= base + (insert << offset)
+            if (!inst.Arg(2).IsImmediate() || !inst.Arg(3).IsImmediate() ||
+                inst.Arg(2).U32() >= 32) {
+                return std::nullopt;
+            }
+            const auto base_value{arg(0)};
+            const auto insert{base_value ? arg(1) : std::nullopt};
+            if (!base_value || !insert || base_value->base != 0 || insert->base != 0 ||
+                base_value->c < 0 || insert->c < 0) {
+                return std::nullopt;
+            }
+            const auto shifted{Scale(*insert, u64{1} << inst.Arg(2).U32())};
+            const auto sum{shifted ? Sum(*base_value, *shifted) : std::nullopt};
+            return sum ? Inexact(*sum) : std::nullopt;
+        }
+        case IR::Opcode::SelectU32: {
+            const auto lhs{arg(1)};
+            const auto rhs{lhs ? arg(2) : std::nullopt};
+            return lhs && rhs ? Max(*lhs, *rhs) : std::nullopt;
+        }
+        case IR::Opcode::Phi: {
+            std::optional<IdBound> result;
+            for (size_t index = 0; index < inst.NumArgs(); ++index) {
+                const auto incoming{arg(index)};
+                if (!incoming) {
+                    return std::nullopt;
+                }
+                result = result ? Max(*result, *incoming) : incoming;
+                if (!result) {
+                    return std::nullopt;
+                }
+            }
+            return result;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    StorageBufferAddr buffer;
+    std::array<u32, 3> workgroup;
+    std::unordered_map<const IR::Inst*, std::optional<IdBound>> memo;
+    std::unordered_set<const IR::Inst*> active;
+    std::optional<IdBound> guard;
+    bool guard_failed{};
+};
 
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
 IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
@@ -1624,7 +2328,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                     continue;
                 }
                 conditions.current = block;
-                CollectStorageBuffers(*block, inst, info, env, conditions);
+                const bool bound{CollectStorageBuffers(*block, inst, info, env, conditions)};
+                info.untracked_writes |= !bound && IsGlobalMemoryWrite(inst);
             }
         }
     };
@@ -1661,14 +2366,71 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                       info.set.size(), max_ssbos);
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
+    // Store extents, before the accesses are rebased (the analysis reads the guest addresses).
+    // None while a store stays global: the backend routes it to the descriptor whose pointer is the
+    // closest one at or below the address, which need not be one of the store's candidates.
+    std::map<StorageBufferAddr, StorageWriteExtent> extents;
+    if (!info.untracked_writes && info.unbounded_writes.empty()) {
+        std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            auto analysis{analyses.find(storage_inst.storage_buffer)};
+            if (analysis == analyses.end()) {
+                analysis = analyses
+                               .emplace(storage_inst.storage_buffer,
+                                        StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                            program.workgroup_size})
+                               .first;
+                // An empty bounded extent, widened by every store
+                extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});
+            }
+            analysis->second.AddStore(*storage_inst.inst, extents[storage_inst.storage_buffer]);
+        }
+    }
     for (const StorageBufferAddr& storage_buffer : info.set) {
+        const bool is_written{info.writes.contains(storage_buffer)};
+        const auto extent{extents.find(storage_buffer)};
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = storage_buffer.index,
             .cbuf_offset = storage_buffer.offset,
             .count = 1,
-            .is_written = info.writes.contains(storage_buffer),
+            .is_written = is_written,
             .indirect_offset = storage_buffer.indirect,
+            .write_extent = is_written && extent != extents.end() ? extent->second
+                                                                  : StorageWriteExtent{},
         });
+    }
+    // Among every bound buffer, the closest base at or below the address can belong to a buffer
+    // bound for another access. An access whose candidates are complete was built from one of
+    // them, so the backend routes it among them alone (one routing function per distinct set).
+    std::map<std::vector<u32>, u32> route_indices;
+    for (RoutedAccess& routed : info.routed) {
+        // A dynamic index can reach slots past those searched, bound for other accesses
+        for (const PointerArray& array : routed.arrays) {
+            for (const StorageBufferAddr& buffer : info.set) {
+                if (buffer.index == array.first.index && buffer.indirect == array.first.indirect &&
+                    buffer.offset >= array.first.offset &&
+                    (buffer.offset - array.first.offset) % array.stride == 0) {
+                    routed.buffers.insert(buffer);
+                }
+            }
+        }
+        if (routed.buffers.size() == info.set.size()) {
+            continue;
+        }
+        std::vector<u32> buffers;
+        for (const StorageBufferAddr& buffer : routed.buffers) {
+            buffers.push_back(static_cast<u32>(info.set.index_of(info.set.find(buffer))));
+        }
+        const auto [route, inserted] = route_indices.try_emplace(
+            buffers, static_cast<u32>(program.global_memory_routes.size()));
+        if (inserted) {
+            program.global_memory_routes.push_back(std::move(buffers));
+        }
+        program.global_memory_route.emplace(routed.inst, route->second);
     }
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
@@ -1693,10 +2455,11 @@ size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
     return limit;
 }
 
-void JoinStorageInfo(Info& base, Info& source, size_t limit) {
+std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
+    std::vector<u32> bindings;
     for (auto& desc : source.storage_buffers_descriptors) {
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {
             return desc.cbuf_index == existing.cbuf_index &&
@@ -1704,14 +2467,92 @@ void JoinStorageInfo(Info& base, Info& source, size_t limit) {
                    desc.indirect_offset == existing.indirect_offset;
         })};
         if (it != descriptors.end()) {
+            if (desc.is_written) {
+                if (it->is_written) {
+                    MergeStorageWriteExtent(it->write_extent, desc.write_extent);
+                } else {
+                    it->write_extent = desc.write_extent;
+                }
+            }
             it->is_written |= desc.is_written;
+            bindings.push_back(static_cast<u32>(it - descriptors.begin()));
             continue;
         }
         if (descriptors.size() >= limit) {
             throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
                                           descriptors.size() + 1, limit);
         }
+        bindings.push_back(static_cast<u32>(descriptors.size()));
         descriptors.push_back(desc);
+    }
+    return bindings;
+}
+
+void RemapStorageBindings(IR::Program& program, std::span<const u32> bindings) {
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            // Each takes the binding as its first argument (see GlobalToStorage and Replace).
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::LoadStorageU8:
+            case IR::Opcode::LoadStorageS8:
+            case IR::Opcode::LoadStorageU16:
+            case IR::Opcode::LoadStorageS16:
+            case IR::Opcode::LoadStorage32:
+            case IR::Opcode::LoadStorage64:
+            case IR::Opcode::LoadStorage128:
+            case IR::Opcode::WriteStorageU8:
+            case IR::Opcode::WriteStorageS8:
+            case IR::Opcode::WriteStorageU16:
+            case IR::Opcode::WriteStorageS16:
+            case IR::Opcode::WriteStorage32:
+            case IR::Opcode::WriteStorage64:
+            case IR::Opcode::WriteStorage128:
+            case IR::Opcode::StorageAtomicIAdd32:
+            case IR::Opcode::StorageAtomicSMin32:
+            case IR::Opcode::StorageAtomicUMin32:
+            case IR::Opcode::StorageAtomicSMax32:
+            case IR::Opcode::StorageAtomicUMax32:
+            case IR::Opcode::StorageAtomicInc32:
+            case IR::Opcode::StorageAtomicDec32:
+            case IR::Opcode::StorageAtomicAnd32:
+            case IR::Opcode::StorageAtomicOr32:
+            case IR::Opcode::StorageAtomicXor32:
+            case IR::Opcode::StorageAtomicExchange32:
+            case IR::Opcode::StorageAtomicCompareExchange32:
+            case IR::Opcode::StorageAtomicIAdd64:
+            case IR::Opcode::StorageAtomicSMin64:
+            case IR::Opcode::StorageAtomicUMin64:
+            case IR::Opcode::StorageAtomicSMax64:
+            case IR::Opcode::StorageAtomicUMax64:
+            case IR::Opcode::StorageAtomicAnd64:
+            case IR::Opcode::StorageAtomicOr64:
+            case IR::Opcode::StorageAtomicXor64:
+            case IR::Opcode::StorageAtomicExchange64:
+            case IR::Opcode::StorageAtomicIAdd32x2:
+            case IR::Opcode::StorageAtomicSMin32x2:
+            case IR::Opcode::StorageAtomicUMin32x2:
+            case IR::Opcode::StorageAtomicSMax32x2:
+            case IR::Opcode::StorageAtomicUMax32x2:
+            case IR::Opcode::StorageAtomicAnd32x2:
+            case IR::Opcode::StorageAtomicOr32x2:
+            case IR::Opcode::StorageAtomicXor32x2:
+            case IR::Opcode::StorageAtomicExchange32x2:
+            case IR::Opcode::StorageAtomicAddF32:
+            case IR::Opcode::StorageAtomicAddF16x2:
+            case IR::Opcode::StorageAtomicAddF32x2:
+            case IR::Opcode::StorageAtomicMinF16x2:
+            case IR::Opcode::StorageAtomicMinF32x2:
+            case IR::Opcode::StorageAtomicMaxF16x2:
+            case IR::Opcode::StorageAtomicMaxF32x2:
+                break;
+            default:
+                continue;
+            }
+            const IR::Value binding{inst.Arg(0)};
+            if (binding.IsImmediate() && binding.U32() < bindings.size()) {
+                inst.SetArg(0, IR::Value{bindings[binding.U32()]});
+            }
+        }
     }
 }
 

@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -70,18 +70,31 @@ private:
 
     vk::Fence GetFreeFence();
 
+    /// Logs the stall and ends the process (EDEN_NX2_GPU_WATCHDOG).
+    [[noreturn]] void ReportUnresponsive(u64 tick, std::chrono::steady_clock::duration stalled) const;
+
 private:
     const Device& device;             ///< Device.
     vk::Semaphore semaphore;          ///< Timeline semaphore.
-    std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
-    std::atomic<u64> current_tick{1}; ///< Current logical tick.
-    std::mutex wait_mutex;
+    /// On their own cache lines: the GPU thread reads current_tick several times a draw, while
+    /// threads refreshing gpu_tick would otherwise make each of those reads miss.
+    alignas(64) std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
+    alignas(64) std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    alignas(64) std::mutex wait_mutex;
     std::mutex free_mutex;
     std::condition_variable_any wait_cv;
     std::queue<Waitable> wait_queue;  ///< Queue for the fences to be waited on by the wait thread.
     std::deque<vk::Fence> free_queue; ///< Holds available fences for submission.
     std::jthread debug_thread;        ///< Debug thread to workaround validation layer bugs.
     std::jthread wait_thread;         ///< Helper thread that waits for submitted fences.
+    /// EDEN_NX2_GPU_WATCHDOG: how long a timeline wait may see no progress on submitted work
+    /// before the process ends; zero leaves it off.
+    std::chrono::seconds watchdog{};
+    std::atomic<u64> accepted_tick{0}; ///< Latest tick the driver accepted a submission for.
+    std::atomic<s64> accepted_ns{0};
+    std::atomic<u64> present_tick{0}; ///< Latest accepted submission that signals for a present.
+    std::atomic<s64> present_ns{0};
+    std::atomic<u64> present_submits{0};
 };
 
 } // namespace Vulkan

@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+
+#ifdef _WIN32
+#include <thread>
+#endif
 
 #include "common/host_memory.h"
 #include "common/typed_address.h"
@@ -26,6 +29,10 @@ public:
 
     DeviceMemory& operator=(const DeviceMemory&) = delete;
     DeviceMemory(const DeviceMemory&) = delete;
+
+#ifdef HAS_NCE
+    [[nodiscard]] u64 PrepareNativeExecution(bool has_39bit_address_space);
+#endif
 
     template <typename T>
     Common::PhysicalAddress GetPhysicalAddr(const T* ptr) const {
@@ -66,6 +73,13 @@ public:
     }
 
     Common::HostMemory buffer;
+
+#ifdef _WIN32
+private:
+    void TrimZeroPages(std::stop_token stop);
+
+    std::jthread zero_trim_thread;
+#endif
 };
 
 } // namespace Core

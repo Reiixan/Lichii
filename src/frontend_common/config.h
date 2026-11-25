@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -47,13 +46,18 @@ public:
 
     [[nodiscard]] bool Exists(const std::string& section, const std::string& key) const;
 
+    /// Saves one setting in a game's config (custom/<config_name>.ini) as the game's own value,
+    /// leaving the rest of that file and the loaded settings as they are.
+    static void SaveGameValue(const std::string& config_name, const Settings::BasicSetting& setting,
+                              const std::string& value);
+
 protected:
     explicit Config(ConfigType config_type = ConfigType::GlobalConfig);
 
     void Initialize(const std::string& config_name = "config");
     void Initialize(std::optional<std::string> config_path);
 
-    void WriteToIni() const;
+    bool WriteToIni() const;
 
     void SetUpIni();
     [[nodiscard]] bool IsCustomConfig() const;

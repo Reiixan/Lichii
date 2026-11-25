@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -55,6 +54,7 @@ template <typename Path>
  * @returns True if file removal succeeds or file does not exist, false otherwise.
  */
 bool RemoveFile(const std::filesystem::path& path);
+bool RemoveFile(const std::filesystem::path& path, std::error_code& ec);
 
 #ifdef _WIN32
 template <typename Path>

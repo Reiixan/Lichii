@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -19,6 +18,8 @@ class System;
 
 namespace Loader {
 
+FileSys::VirtualFile ResolveLooseProgram(const FileSys::VirtualDir& directory);
+
 /**
  * This class loads a "deconstructed ROM directory", which are the typical format we see for Switch
  * game dumps. The path should be a "main" NSO, which must be in a directory that contains the other
@@ -29,7 +30,12 @@ class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:
     explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile main_file, bool override_update_ = false);
     // Overload to accept exefs directory. Must contain 'main' and 'main.npdm'
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory, bool override_update_ = false);
+    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory,
+                                                 bool override_update_ = false,
+                                                 bool apply_installed_update_ = true);
+
+    static std::pair<ResultStatus, std::unique_ptr<AppLoader_DeconstructedRomDirectory>>
+    CreateNativeHomeExecutable(const FileSys::VirtualDir& immutable_verified_exefs);
 
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
@@ -42,6 +48,9 @@ public:
     static FileType IdentifyType(const FileSys::VirtualFile& dir_file);
 
     FileType GetFileType() const override {
+        if (exact_modules) {
+            return FileType::DeconstructedRomDirectory;
+        }
         return IdentifyType(file);
     }
 
@@ -56,8 +65,12 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadMainBuildId(Core::System& system, std::array<u8, 0x20>& build_id) override;
 
 private:
+    using ExeFSModules = std::array<FileSys::VirtualFile, 13>;
+    AppLoader_DeconstructedRomDirectory(ExeFSModules modules, FileSys::ProgramMetadata program);
+
     /// The loose RomFS next to the ExeFS, found (and built) on first use.
     const FileSys::VirtualFile& LooseRomFS();
 
@@ -73,6 +86,8 @@ private:
     std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
     u64 title_id{};
     bool override_update;
+    bool apply_installed_update{true};
+    std::optional<ExeFSModules> exact_modules;
 
     Modules modules;
 };

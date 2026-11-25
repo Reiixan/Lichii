@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -12,6 +11,9 @@
 #include "core/hle/service/ns/ns_types.h"
 
 namespace Service::NS {
+
+Result ResolveApplicationDesiredLanguage(Out<ApplicationLanguage> out_desired_language,
+                                         u32 supported_languages, bool allow_unlisted_language);
 
 class IReadOnlyApplicationControlDataInterface final
     : public ServiceFramework<IReadOnlyApplicationControlDataInterface> {

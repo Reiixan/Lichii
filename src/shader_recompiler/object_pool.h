@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -21,6 +20,13 @@ public:
         requires std::is_constructible_v<T, Args...>
     [[nodiscard]] T* Create(Args&&... args) {
         return std::construct_at(Memory(), std::forward<Args>(args)...);
+    }
+
+    /// Destroys the objects and returns their memory; ReleaseContents keeps it for reuse
+    void Free() {
+        chunks.clear();
+        chunks.shrink_to_fit();
+        node = &chunks.emplace_back(new_chunk_size);
     }
 
     void ReleaseContents() {

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -25,6 +24,17 @@ class Scheduler;
 class StagingBufferPool;
 
 struct QueryCacheRuntimeImpl;
+
+/// EDEN_NX2_RENDER_QUERY_SYNC_E: a buffer the back obtained at a posted fence or wait for idle
+/// for the value syncs GPURender runs there: guest bytes [begin, begin + bytes) at offset.
+struct QuerySyncTarget {
+    DAddr begin;
+    u64 bytes;
+    VkBuffer buffer;
+    u64 offset;
+};
+/// GPURender, while it plays such an op: its targets (null otherwise).
+inline thread_local const std::vector<QuerySyncTarget>* t_query_sync_targets{};
 
 class QueryCacheRuntime {
 public:

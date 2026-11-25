@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -59,7 +58,6 @@ void SetInBoundsFlag(IR::Inst* inst, Id result) {
         return;
     }
     in_bounds->SetDefinition(result);
-    in_bounds->Invalidate();
 }
 
 Id ComputeMinThreadId(EmitContext& ctx, Id thread_id, Id segmentation_mask) {

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(shader_recompiler STATIC
@@ -199,6 +198,7 @@ add_library(shader_recompiler STATIC
     program_header.h
     runtime_info.h
     shader_info.h
+    storage_write_extent.h
     varying_state.h)
 
 if (ENABLE_OPENGL)

@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -19,7 +18,7 @@ struct KAddressSpaceInfo final {
     };
 
     static std::size_t GetAddressSpaceStart(std::size_t width, Type type);
-    static std::size_t GetAddressSpaceSize(std::size_t width, Type type);
+    static std::size_t GetAddressSpaceSize(std::size_t width, Type type, u64 switch2_program_id = 0);
 
     const std::size_t bit_width{};
     const std::size_t address{};

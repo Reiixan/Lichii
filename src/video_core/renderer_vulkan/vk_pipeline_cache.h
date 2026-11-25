@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -12,10 +11,12 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -31,13 +32,19 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/bounded_store.h"
+#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_vertex_input.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_cache_v2/cache.h"
+#include "video_core/shader_jobs.h"
+#include "video_core/shader_stage_translation.h"
 
 namespace Core {
 class System;
@@ -50,6 +57,11 @@ struct Program;
 namespace VideoCore {
 class ShaderNotify;
 }
+
+namespace VideoCommon::ShaderCacheV2 {
+struct LogFile;
+struct ProgramRecord;
+} // namespace VideoCommon::ShaderCacheV2
 
 namespace Vulkan {
 
@@ -96,17 +108,7 @@ class Scheduler;
 
 using VideoCommon::ShaderInfo;
 
-struct ShaderPools {
-    void ReleaseContents() {
-        flow_block.ReleaseContents();
-        block.ReleaseContents();
-        inst.ReleaseContents();
-    }
-
-    Shader::ObjectPool<Shader::IR::Inst> inst{8192};
-    Shader::ObjectPool<Shader::IR::Block> block{32};
-    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
-};
+using VideoCommon::ShaderPools;
 
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
@@ -116,6 +118,11 @@ struct ComputePipelineCacheEntry {
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
+    /// Whether a dispatch looked it up yet (kept only with EDEN_NX2_STUTTER_TRACE)
+    bool used{};
+    /// A rebuild whose driver compile runs on a worker; this entry's pipeline is used until it is
+    /// built (a compile waited on by the dispatch stalled every GPU channel for 2-3 s)
+    std::unique_ptr<ComputePipelineCacheEntry> pending_rebuild;
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -131,11 +138,39 @@ public:
                            TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
     ~PipelineCache();
 
-    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    /// key_unchanged: no register the key reads changed since this cache's last lookup, which
+    /// the caller made (EDEN_NX2_RENDER_UNLEND_FAST_DELTA).
+    [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline(bool key_unchanged = false);
+    [[nodiscard]] u64 GraphicsLookups() const noexcept {
+        return graphics_lookups;
+    }
+    /// Whether the last lookup kept the current pipeline without refreshing the key.
+    [[nodiscard]] bool LastLookupKept() const noexcept {
+        return last_lookup_kept;
+    }
+
+    [[nodiscard]] const DynamicFeatures& Features() const noexcept {
+        return dynamic_features;
+    }
 
     void TickFrame();
 
-    [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+    [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH, on the back: CurrentComputePipeline when it is a plain
+    /// hit (the shader known, its entry built, no rebuild pending or due, no game hook acting);
+    /// nullptr, having created or retired nothing, otherwise. A retire stamps GPURender's tick,
+    /// which posted dispatches it has not recorded yet would outlive.
+    [[nodiscard]] ComputePipeline* UnlentComputePipeline(u64& native_key);
+
+    /// Whether a Switch 2 dispatch whose compute pipeline is still building is skipped instead
+    /// of waiting for the build, as native_async_draws decides for draws. Skipping leaves the
+    /// dispatch's outputs as they are, which costs a frame of its work only when shaders wrote
+    /// them before (a pass the game runs every frame); otherwise they would keep a clear value
+    /// or whatever the guest left there, so those dispatches wait. A Bounded wait takes from the
+    /// draws' budget.
+    /// @param outputs_hold_gpu_data Every buffer byte the dispatch writes holds GPU writes, and
+    ///                              every image level it writes holds storage writes.
+    [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data);
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
@@ -143,17 +178,53 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    [[nodiscard]] bool SkipPendingMeshDraw() const;
+
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
-    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+    /// How native work with an unbuilt pipeline is handled: native_async_draws, or Skip with
+    /// EDEN_NX2_ASYNC_DISCARD=1.
+    [[nodiscard]] NativePendingMode NativeMode() const;
 
+    /// Logs the bounded waits' time every 10 s.
+    void LogBoundedWaits();
+
+    /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
+    /// pointers whatever they hold now. `evicted`: a pipeline of this key was evicted.
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers, bool evicted);
+
+    /// Builds the current key's pipeline again from what an evicted one kept, without translating
+    std::unique_ptr<GraphicsPipeline> RebuildGraphicsPipeline(KeptGraphicsStages kept);
+
+    /// Logs a kept pointer slot (an index of keep_pointers) that this translation would otherwise
+    /// have classified as no pointer: null, unmapped, or out of range right now.
+    void WarnKeptPointer(size_t program, u64 slot) const;
+
+    /// Shader cache v2, run-time misses: the stages translated at once on shader_jobs' CPU workers
+    /// while the GPU thread waited (VideoCommon::TranslateStages)
+    struct ParallelTranslation {
+        std::chrono::nanoseconds wait{};   ///< On the GPU thread
+        std::chrono::nanoseconds stages{}; ///< The stages' translations together
+        size_t count{};
+    };
+
+    /// Builds the pipeline as a job of shader_jobs with build_in_parallel, else leaves it for the
+    /// caller's Build() (see BuildQueue). With `parallel` the stages translate at once on
+    /// shader_jobs, each in IR pools of its own; their environments must be safe to read from those
+    /// threads.
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr);
+        ParallelTranslation* parallel = nullptr);
+
+    /// Released IR pools for a build, or new ones
+    [[nodiscard]] std::shared_ptr<ShaderPools> TakeSparePools();
+    /// Releases the pools' contents and keeps a few for later builds
+    void ReturnPools(std::shared_ptr<ShaderPools> pools);
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
@@ -163,19 +234,76 @@ private:
                                                     const ShaderInfo* shader,
                                                     std::span<const u64> keep_pointers = {});
 
+    /// Builds the pipeline as CreateGraphicsPipeline does. With `emit_pools`, which `pools` must
+    /// be, the SPIR-V is emitted by the CPU stage of the pipeline's job, which takes the pools and
+    /// the program.
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel);
+                                                     bool build_in_parallel,
+                                                     std::shared_ptr<ShaderPools> emit_pools = nullptr);
 
-    void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+    /// Where CreateGraphicsPipeline and CreateComputePipeline build; `cpu_bytes` estimates the
+    /// IR a deferred emission holds
+    [[nodiscard]] PipelineBuildQueue BuildQueue(bool build_in_parallel, u64 cpu_bytes = 0);
+
+    /// Whether the device can build a cached graphics pipeline of this key: its dynamic state
+    /// and provoking vertex must match the device's
+    [[nodiscard]] bool KeyFitsDevice(const GraphicsPipelineCacheKey& key) const;
+
+    /// The boot load of the v2 cache (LoadDiskResources): `log` read, its records built as jobs
+    /// of shader_jobs. Without `build_at_boot` it builds, prebuilds and lowers again nothing.
+    void LoadPipelinesV2(u64 title_id,
+                         std::shared_ptr<const VideoCommon::ShaderCacheV2::LogFile> log,
+                         std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback,
+                         std::chrono::steady_clock::time_point load_begin, bool precache,
+                         bool build_at_boot);
+
+    /// Reads a v2 graphics record and translates its pipeline, left for Build(). Null when it
+    /// doesn't translate, `incomplete` when the record lacks a value the translation reads.
+    /// Throws std::ios_base::failure for a record it can't read.
+    std::unique_ptr<GraphicsPipeline> TranslateCachedGraphics(std::span<const u8> payload,
+                                                              const GraphicsPipelineCacheKey& key,
+                                                              PipelineStatistics* statistics,
+                                                              bool& incomplete);
+
+    /// Cancels the v2 prebuild and waits for its running stages
+    void StopBackgroundJobs();
+
+    /// Returns true when the file was written and replaced the previous one.
+    bool SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
 
+    /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                               u32 expected_cache_version);
 
     void QueueVulkanPipelineCacheFlush();
+
+    /// Queues one write of the driver pipeline cache file on the serialization thread, with no
+    /// throttle, or writes it now where reading the cache during a build crashes. For the end of
+    /// a precache: its builds never reach the timed flush, which counts only pipelines built
+    /// during play. `after_save` runs once the file was written, never when the write failed.
+    void QueueVulkanPipelineCacheSave(std::function<void()> after_save = {});
+
+    /// One build of the shader precache: a compute pipeline built and destroyed
+    struct PrecacheJob {
+        /// Translates the pipeline and returns its build, which is true when it built (the job's
+        /// CPU and driver stages)
+        Common::UniqueFunction<Common::UniqueFunction<bool>> translate;
+        u64 cpu_bytes{};
+    };
+
+    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the compute
+    /// programs of the title's precache file (made from the game files, missing reads guessed) are
+    /// built, then thrown away. They only fill the driver's shader cache, so a later build of the
+    /// same pipeline finds the driver's work done. The cached graphics pipelines the boot skipped
+    /// are the background prebuild's. Reports progress through `callback` and returns when it is
+    /// done, skipped from the loading screen or the load is stopped.
+    void PrecacheShaders(u64 title_id, std::stop_token stop_loading,
+                         const VideoCore::DiskResourceLoadCallback& callback);
 
     const Device& device;
     Scheduler& scheduler;
@@ -188,11 +316,27 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
-    const size_t num_pipeline_workers;
-    EmissionBudget emission_budget;
+    /// Whether this boot's Vulkan pipeline cache started from the saved file, not empty
+    bool vulkan_pipeline_cache_restored{};
+    /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
+    /// builds it runs.
+    std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;
+    /// IR of the pipelines whose job emits their SPIR-V
+    QueuedIrBudget queued_ir{VideoCommon::DefaultShaderJobBudget()};
+    std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;
+    /// When the boot load that started the background prebuild began, until the prebuild is done
+    std::optional<std::chrono::steady_clock::time_point> prebuild_load_begin;
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// Native mesh draws' vertex input, lent by the first key of each pipeline
+    MeshVertexInputs<GraphicsPipelineCacheKey> mesh_vertex_inputs;
+    /// mesh_vertex_inputs holds the mesh pipelines the boot load built
+    bool mesh_vertex_inputs_seeded{};
+    /// graphics_key holds vertex input another key lent it instead of the registers'
+    bool vertex_input_lent{};
+    u64 graphics_lookups{};
+    bool last_lookup_kept{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
@@ -203,6 +347,12 @@ private:
     s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    std::unordered_set<u64> evicted_hashes;   ///< Key hashes of evicted pipelines not created again
+    VideoCommon::EvictedPointerSlots evicted_pointer_slots;
+    /// The SPIR-V and stage infos of evicted pipelines, which build them again when used again
+    VideoCommon::BoundedStore<GraphicsPipelineCacheKey, KeptGraphicsStages> kept_stages{0};
+    u64 rebuilt_from_kept{};  ///< Since the last eviction
+    u64 translated_again{};   ///< Evicted pipelines translated again since the last eviction
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
@@ -223,11 +373,21 @@ private:
     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
     /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
     std::unordered_set<u64> disk_pipelines;
+    /// Key hashes of disk records the background prebuild found lacking a value the translator
+    /// reads: the pipeline built when first needed is recorded again and supersedes the record.
+    std::unordered_set<u64> incomplete_prebuilds;
+    std::mutex incomplete_prebuilds_mutex;
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
-    std::filesystem::path used_pipelines_filename;
     std::chrono::steady_clock::time_point used_pipelines_saved{};
     void SaveUsedPipelines();
+
+    /// The cache pipeline_cache_filename names, and this session's Used record
+    std::unique_ptr<VideoCommon::ShaderCacheV2::Cache> cache_v2;
+    /// Its driver layer, where the device has VK_KHR_pipeline_binary
+    std::unique_ptr<PipelineBinaries> pipeline_binaries;
+    u64 used_session_key{};
+    u64 used_session_time{};
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
@@ -236,10 +396,11 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
-    Common::ThreadWorker workers;
+    /// Requested first when the cache is destroyed, to stop a rewrite of the disk cache: Android
+    /// and lichii_cmd load with a stop token that never stops
+    std::stop_source serialization_stop;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
-    PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 };
 
 } // namespace Vulkan

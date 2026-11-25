@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
@@ -48,6 +47,9 @@ std::optional<OutAttr> OutputAttrPointer(EmitContext& ctx, IR::Attribute attr) {
         const u32 index{IR::GenericAttributeIndex(attr)};
         const u32 element{IR::GenericAttributeElement(attr)};
         const GenericElementInfo& info{ctx.output_generics.at(index).at(element)};
+        if (!Sirit::ValidId(info.id)) {
+            return std::nullopt; // output pruned, nothing downstream reads it
+        }
         if (info.num_components == 1) {
             return info.id;
         } else {
@@ -314,7 +316,15 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
         }
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
-        const Id value{ctx.OpLoad(generic.component_type, pointer)};
+        Id value{ctx.OpLoad(generic.component_type, pointer)};
+        if (ctx.stage == Stage::Fragment && ctx.noperspective_as_smooth_inputs[index]) {
+            // Written times Position.w and interpolated perspective-correct: undo with 1/w.
+            // Only float inputs are marked, and DefineInputs forces FragCoord for them.
+            ASSERT(generic.load_op == InputGenericLoadOp::None && ValidId(ctx.input_position));
+            const Id frag_w{ctx.OpLoad(
+                ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.input_position, ctx.Const(3u)))};
+            value = ctx.OpFMul(ctx.F32[1], value, frag_w);
+        }
         return [&ctx, generic, value]() {
             switch (generic.load_op) {
             case InputGenericLoadOp::Bitcast:
@@ -422,13 +432,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, [[maybe_un
         value = ctx.OpBitcast(output->type, value);
     }
 
-    static constexpr IR::Attribute cd0 = IR::Attribute::ClipDistance0;
-    static constexpr IR::Attribute cd7 = IR::Attribute::ClipDistance7;
-
-    if (attr >= cd0 && attr <= cd7) {
-        const u32 idx = (u32) attr - (u32) cd0;
-        clip_distance_written.set(idx);
-    }
     ctx.OpStore(output->pointer, value);
 }
 
@@ -512,13 +515,43 @@ void EmitSetSampleMask(EmitContext& ctx, Id value) {
 }
 
 void EmitSetFragDepth(EmitContext& ctx, Id value) {
-    if (!ctx.runtime_info.convert_depth_mode || ctx.profile.support_native_ndc) {
-        ctx.OpStore(ctx.frag_depth, value);
-        return;
+    Id depth{value};
+    if (ctx.runtime_info.convert_depth_mode && !ctx.profile.support_native_ndc) {
+        const Id unit{ctx.Const(0.5f)};
+        depth = ctx.OpFma(ctx.F32[1], depth, unit, unit);
     }
-    const Id unit{ctx.Const(0.5f)};
-    const Id new_depth{ctx.OpFma(ctx.F32[1], value, unit, unit)};
-    ctx.OpStore(ctx.frag_depth, new_depth);
+    if (ctx.runtime_info.quantize_frag_depth_d24) {
+        // Two passes that compute the same depth a few float ULPs apart store the same D24 value
+        // on the guest, so an equal depth test between them passes there; keep that on the host.
+        // Fixed-function depth stays a float, so FragCoord.z passes through unrounded to keep
+        // matching it.
+        const Id f32{ctx.F32[1]};
+        const Id max_unorm{ctx.Const(16777215.0f)};
+        const Id half{ctx.Const(0.5f)};
+        const Id one{ctx.Const(1.0f)};
+        const Id clamped{ctx.OpNMin(f32, ctx.OpNMax(f32, depth, ctx.f32_zero_value), one)};
+        // The product can round to the wrong side of a half. d * (2^24 - 1) - guess is
+        // (d * 2^24 - guess) - d, where the first part and its sum with +-0.5 are exact, so
+        // comparing that against d picks the nearest code without relying on fma fusion.
+        const Id guess{ctx.OpRoundEven(f32, ctx.OpFMul(f32, clamped, max_unorm))};
+        const Id scaled{ctx.OpFMul(f32, clamped, ctx.Const(16777216.0f))};
+        const Id residual{ctx.OpFSub(f32, scaled, guess)};
+        const Id residual_up{ctx.OpFSub(f32, residual, half)};
+        const Id residual_down{ctx.OpFAdd(f32, residual, half)};
+        for (const Id exact : {residual, residual_up, residual_down}) {
+            ctx.Decorate(exact, spv::Decoration::NoContraction);
+        }
+        const Id up{ctx.OpFOrdGreaterThan(ctx.U1, residual_up, clamped)};
+        const Id down{ctx.OpFOrdLessThan(ctx.U1, residual_down, clamped)};
+        const Id step{ctx.OpSelect(f32, up, one,
+                                   ctx.OpSelect(f32, down, ctx.OpFNegate(f32, one),
+                                                ctx.f32_zero_value))};
+        const Id rounded{ctx.OpFDiv(f32, ctx.OpFAdd(f32, guess, step), max_unorm)};
+        const Id frag_z{ctx.OpLoad(f32, ctx.OpAccessChain(ctx.input_f32, ctx.input_position,
+                                                          ctx.Const(2u)))};
+        depth = ctx.OpSelect(f32, ctx.OpFOrdEqual(ctx.U1, depth, frag_z), depth, rounded);
+    }
+    ctx.OpStore(ctx.frag_depth, depth);
 }
 
 void EmitGetZFlag(EmitContext&) {

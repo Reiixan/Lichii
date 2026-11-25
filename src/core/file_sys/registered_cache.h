@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -52,6 +52,8 @@ struct ContentProviderEntry {
 
     std::string DebugInfo() const;
 };
+
+using GameListApplicationPaths = std::map<u64, std::string>;
 
 struct ExternalUpdateEntry {
     u64 title_id;
@@ -178,7 +180,7 @@ public:
                                const VfsCopyFunction& copy = &VfsRawCopy);
 
     // Due to the fact that we must use Meta-type NCAs to determine the existence of files, this
-    // poses quite a challenge. Instead of creating a new meta NCA for this file, yuzu will create a
+    // poses quite a challenge. Instead of creating a new meta NCA for this file, Lichii will create a
     // dir inside the NAND called 'yuzu_meta' and store the raw CNMT there.
     // TODO(DarkLordZach): Author real meta-type NCAs and install those.
     InstallResult InstallEntry(const NCA& nca, TitleType type, bool overwrite_if_exists = false,
@@ -199,13 +201,13 @@ private:
                             std::function<bool(const CNMT&, const ContentRecord&)> filter) const;
     std::vector<NcaID> AccumulateFiles() const;
     void ProcessFiles(const std::vector<NcaID>& ids);
-    void AccumulateYuzuMeta();
+    void AccumulateRawMeta();
     std::optional<NcaID> GetNcaIDFromMetadata(u64 title_id, ContentRecordType type) const;
     VirtualFile GetFileAtID(NcaID id) const;
     VirtualFile OpenFileOrDirectoryConcat(const VirtualDir& open_dir, std::string_view path) const;
     InstallResult RawInstallNCA(const NCA& nca, const VfsCopyFunction& copy,
                                 bool overwrite_if_exists, std::optional<NcaID> override_id = {});
-    bool RawInstallYuzuMeta(const CNMT& cnmt);
+    bool RawInstallMeta(const CNMT& cnmt);
 
     VirtualDir dir;
     ContentProviderParsingFunction parser;
@@ -215,7 +217,7 @@ private:
     // maps tid -> meta
     ::Common::unordered_map<u64, CNMT> meta;
     // maps tid -> meta for CNMT in yuzu_meta
-    ::Common::unordered_map<u64, CNMT> yuzu_meta;
+    ::Common::unordered_map<u64, CNMT> raw_meta;
 };
 
 enum class ContentProviderUnionSlot {
@@ -260,6 +262,8 @@ private:
 
 class ManualContentProvider : public ContentProvider {
 public:
+    explicit ManualContentProvider(
+        std::function<std::vector<u8>(u64)> read_application_icon = {});
     ~ManualContentProvider() override;
 
     void AddEntry(TitleType title_type, ContentRecordType content_type, u64 title_id,
@@ -269,6 +273,12 @@ public:
     bool AddEntriesFromContainer(VirtualFile file, bool only_content = false,
                                  std::optional<u64> base_program_id = std::nullopt);
     void ClearAllEntries();
+
+    /// Publish the paths from the last completed game-list scan, independently of NCA entries.
+    void ReplaceApplicationPaths(GameListApplicationPaths paths);
+    std::optional<std::string> GetApplicationPath(u64 program_id) const;
+    std::vector<u8> ReadApplicationIcon(u64 program_id) const;
+    std::vector<u64> ListApplicationFiles() const;
 
     void Refresh() override;
     bool HasEntry(u64 title_id, ContentRecordType type) const override;
@@ -286,6 +296,8 @@ public:
 private:
     std::map<std::tuple<TitleType, ContentRecordType, u64>, VirtualFile> entries;
     std::vector<ExternalUpdateEntry> multi_version_entries;
+    GameListApplicationPaths application_paths;
+    const std::function<std::vector<u8>(u64)> read_application_icon;
 };
 
 class ExternalContentProvider : public ContentProvider {

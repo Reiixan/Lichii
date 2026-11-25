@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -18,20 +17,25 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
-#include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/dlss_contract.h"
-#include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/oot_network.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_cache_v2/cache.h"
+#include "video_core/shader_cache_v2/records.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
 
@@ -62,6 +66,70 @@ void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
 void ShaderCache::SyncGuestHost() {
     std::scoped_lock lock{invalidation_mutex};
     RemovePendingShaders();
+}
+
+namespace {
+
+std::vector<u8> ReadProgramBytes(Tegra::MemoryManager& gpu_memory, GPUVAddr address, size_t size) {
+    std::vector<u8> bytes(size);
+    gpu_memory.ReadBlockUnsafe(address, bytes.data(), bytes.size());
+    return bytes;
+}
+
+} // Anonymous namespace
+
+std::vector<CapturedProgram> ShaderCache::CaptureGraphicsPrograms(
+    const std::array<u64, NUM_PROGRAMS>& unique_hashes) const {
+    constexpr size_t native_header_size = 128;
+    std::vector<CapturedProgram> programs;
+    const auto& regs{maxwell3d->regs};
+    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
+    for (size_t index = 0; index < NUM_PROGRAMS; ++index) {
+        const ShaderInfo* const info = shader_infos[index];
+        if (unique_hashes[index] == 0 || !info || info->unique_hash != unique_hashes[index]) {
+            continue;
+        }
+        const auto& config{regs.pipelines[index]};
+        const GPUVAddr address{native ? (static_cast<u64>(config.reserved[0] & 0xff) << 32) |
+                                            config.reserved[1]
+                                      : regs.program_region.Address() + config.offset};
+        CapturedProgram program{
+            .slot = static_cast<u32>(index), .unique_hash = info->unique_hash, .address = address};
+        if (const auto& lowered = info->lowered_native) {
+            const size_t size = lowered->source_size;
+            program.native_key = lowered->native_program_key;
+            program.header =
+                ReadProgramBytes(*gpu_memory, address, (std::min)(size, native_header_size));
+            if (size > native_header_size) {
+                program.code = ReadProgramBytes(*gpu_memory, address + native_header_size,
+                                                size - native_header_size);
+            }
+        } else {
+            program.code = ReadProgramBytes(*gpu_memory, address, info->size_bytes);
+        }
+        programs.push_back(std::move(program));
+    }
+    return programs;
+}
+
+std::optional<CapturedProgram> ShaderCache::CaptureComputeProgram() const {
+    const GPUVAddr address{kepler_compute->regs.code_loc.Address() +
+                           kepler_compute->launch_description.program_start};
+    const std::optional<VAddr> cpu_address{gpu_memory->GpuToCpuAddress(address)};
+    const ShaderInfo* const info = cpu_address ? TryGet(*cpu_address) : nullptr;
+    if (!info) {
+        return std::nullopt;
+    }
+    const auto& lowered = info->lowered_native;
+    return CapturedProgram{
+        .slot = static_cast<u32>(NUM_PROGRAMS),
+        .unique_hash = info->unique_hash,
+        .native_key = lowered ? lowered->native_program_key : 0,
+        .address = address,
+        .header = {},
+        .code = ReadProgramBytes(*gpu_memory, address,
+                                 lowered ? lowered->source_size : info->size_bytes),
+    };
 }
 
 void ShaderCache::RefreshDebugRejections(bool unrejected) {
@@ -117,9 +185,11 @@ u64 ShaderCache::MeshStateHash() const {
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
-    if (!dirty[VideoCommon::Dirty::Shaders]) {
+    const u64 removals{removal_serial.load(std::memory_order_acquire)};
+    if (!dirty[VideoCommon::Dirty::Shaders] && removals == seen_removal_serial) {
         return last_shaders_valid;
     }
+    seen_removal_serial = removals;
     dirty[VideoCommon::Dirty::Shaders] = false;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
@@ -165,7 +235,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 // Native programs are lowered while the environment is built (once: the
                 // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
-                GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
+                const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
+                GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address,
+                                        {}, shader_cache_v2};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
@@ -278,7 +350,9 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
-            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+            const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
+            ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start, {},
+                                   shader_cache_v2};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {
             // Constants can become valid on the next dispatch; do not cache this rejection.
@@ -304,6 +378,44 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
     return shader;
+}
+
+const ShaderInfo* ShaderCache::KnownComputeShader() const {
+    const auto& qmd{kepler_compute->launch_description};
+    const std::optional<VAddr> cpu_shader_addr{
+        gpu_memory->GpuToCpuAddress(kepler_compute->regs.code_loc.Address() + qmd.program_start)};
+    return cpu_shader_addr ? TryGet(*cpu_shader_addr) : nullptr;
+}
+
+bool ShaderCache::KnownComputeShaderChecks(const ShaderInfo* shader) {
+    if (!shader->lowered_native) {
+        return true;
+    }
+    const u64 key = shader->lowered_native->native_program_key;
+    if (kepler_compute->IsNativeMode()) {
+        using namespace OotNetwork;
+        const bool network_pass =
+            BypassEnabled(program_id) &&
+            (key == PrepassProgramKey || key == UnusedDispatchProgramKey ||
+             key == NetworkProgramKey || key == OutputProgramKey ||
+             std::ranges::find(BaseOutputPrograms, key, &BaseOutputProgram::key) !=
+                 BaseOutputPrograms.end());
+        if (network_pass || DlssContract::IsFastFusionCandidate(program_id, key) ||
+            FireEmblemUpscale::CapturedPasses(program_id)) {
+            return false;
+        }
+    }
+    if (!Shader::Ampere::VerifyTrapGuards(
+            shader->lowered_native->trap_prefix, [&](u32 bank, u32 offset) {
+                return ReadNativeGuardConstant(*kepler_compute, *gpu_memory, bank, offset);
+            })) {
+        throw Shader::Ampere::TrapGuardError{};
+    }
+    // Any other program: the bypass notes the first one after the network, nothing else.
+    if (kepler_compute->IsNativeMode() && kepler_compute->BypassOotNetwork(program_id, key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
+    }
+    return true;
 }
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {
@@ -373,8 +485,8 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     Entry* const entry = NewEntry(addr, addr_end, data.get());
     page_filter.Mark(addr, size);
 
-    const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
-    for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
+    const u64 page_end = (addr_end + LICHII_PAGESIZE - 1) >> LICHII_PAGEBITS;
+    for (u64 page = addr >> LICHII_PAGEBITS; page < page_end; ++page) {
         invalidation_cache[page].push_back(entry);
     }
 
@@ -394,8 +506,8 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
             return rejected.first >= addr && rejected.first < addr_end;
         });
     }
-    const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
-    for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
+    const u64 page_end = (addr_end + LICHII_PAGESIZE - 1) >> LICHII_PAGEBITS;
+    for (u64 page = addr >> LICHII_PAGEBITS; page < page_end; ++page) {
         auto it = invalidation_cache.find(page);
         if (it == invalidation_cache.end()) {
             continue;
@@ -424,6 +536,8 @@ void ShaderCache::RemovePendingShaders() {
     marked_for_removal.clear();
 
     if (!removed_shaders.empty()) {
+        Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
+        removal_serial.fetch_add(1, std::memory_order_release);
         if (removed_shaders.size() > 16) {
             std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
             std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
@@ -454,8 +568,8 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
 }
 
 void ShaderCache::RemoveEntryFromInvalidationCache(const Entry* entry) {
-    const u64 page_end = (entry->addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
-    for (u64 page = entry->addr_start >> YUZU_PAGEBITS; page < page_end; ++page) {
+    const u64 page_end = (entry->addr_end + LICHII_PAGESIZE - 1) >> LICHII_PAGEBITS;
+    for (u64 page = entry->addr_start >> LICHII_PAGEBITS; page < page_end; ++page) {
         const auto entries_it = invalidation_cache.find(page);
         ASSERT(entries_it != invalidation_cache.end());
         std::vector<Entry*>& entries = entries_it->second;
@@ -499,6 +613,9 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
         info->size_bytes = env.ReadSizeBytes();
     }
     info->lowered_native = env.LoweredNative();
+    if (const auto record = env.TakeProgramRecord(); record && shader_cache_v2) {
+        shader_cache_v2->RecordProgram(*record);
+    }
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
     Register(std::move(info), cpu_addr, size_bytes);

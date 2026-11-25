@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -23,10 +22,10 @@ public:
                       bool from_back, KMemoryManager::Pool pool, KProcessAddress code_address,
                       size_t code_size, KSystemResource* system_resource,
                       KResourceLimit* resource_limit, Core::Memory::Memory& memory,
-                      KProcessAddress aslr_space_start) {
+                      KProcessAddress aslr_space_start, u64 switch2_program_id = 0) {
         R_RETURN(m_page_table.InitializeForProcess(
             as_type, enable_aslr, enable_das_merge, from_back, pool, code_address, code_size,
-            system_resource, resource_limit, memory, aslr_space_start));
+            system_resource, resource_limit, memory, aslr_space_start, switch2_program_id));
     }
 
     void Finalize() {

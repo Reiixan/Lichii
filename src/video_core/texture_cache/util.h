@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -20,6 +19,10 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
+namespace Settings {
+struct ResolutionScalingInfo;
+}
+
 namespace Tegra::Texture {
 class UnswizzleWorker;
 }
@@ -36,7 +39,7 @@ struct OverlapResult {
     SubresourceExtent resources;
 };
 
-[[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u64 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
 
@@ -90,6 +93,7 @@ struct UnswizzlePlan {
     boost::container::small_vector<UnswizzleRowRun, 16> runs;
     size_t total_host_bytes{0};
     u32 bpp_log2{0};
+    bool native_tiling{false};
     bool layout_valid{true};
 };
 
@@ -103,10 +107,14 @@ struct UnswizzlePlan {
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output);
 
+/// Reads one byte of each 4 KiB page of a guest range about to be read in full, on the texture
+/// workers and this thread at once (Windows only, ranges of 1 MiB or more).
+void PrefaultGuestMemory(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, size_t size);
+
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output,
-    Tegra::Texture::UnswizzleWorker* worker = nullptr);
+    Tegra::Texture::UnswizzleWorker* worker = nullptr, u32 first_level = 0);
 
 /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
 /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into
@@ -140,6 +148,17 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
 
+/// Sets `written[level * layers + layer]` for each level and layer of `dst` that `copies` from
+/// `src` write whole, unscaled and from the origin. Sets none when the images differ in 2D format,
+/// the format is compressed, or either image is rescaled or lacks part of its host memory (sparse,
+/// unbacked, trimmed levels).
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written);
+
+/// Whether `copies` from `src` write every texel of `dst` (MarkSubresourcesWrittenWhole).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
+
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);
 
@@ -150,6 +169,40 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 [[nodiscard]] bool IsBlockLinearSizeCompatible(const ImageInfo& new_info,
                                                const ImageInfo& overlap_info, u32 new_level,
                                                u32 overlap_level, bool strict_size) noexcept;
+
+/// Whether an image scaled by the resolution setting is at most max_extent texels wide and tall
+/// on the host (MSAA images have their sample grid in info.size).
+[[nodiscard]] bool ScaledImageFits(const ImageInfo& info,
+                                   const Settings::ResolutionScalingInfo& resolution,
+                                   u32 max_extent) noexcept;
+
+/// Whether a block-linear 2D image is wider than `width` by padding only: made `width` wide, it
+/// takes the same guest memory with the same layout.
+[[nodiscard]] bool IsPaddedWidth(const ImageInfo& info, u32 width) noexcept;
+
+/// Whether a block-linear 2D image is wider than tall by padding only.
+[[nodiscard]] bool IsPaddedSquare(const ImageInfo& info) noexcept;
+
+/// The width a Switch 2 render target is looked up at: the surface clip's right edge when the
+/// target is wider than that by padding only, else its own.
+[[nodiscard]] u32 PaddedTargetWidth(const ImageInfo& info, u32 clip_right) noexcept;
+
+/// The width a Switch 2 blit surface is looked up at for the copy span [x0, x1): x1 for a forward
+/// span from 0 or after that ends where the padding starts, else its own.
+[[nodiscard]] u32 PaddedBlitWidth(const ImageInfo& info, s32 x0, s32 x1) noexcept;
+
+/// The surface clip's right edge the bound render targets were looked up with. A padded target's
+/// lookup width depends on it, and the clip sets only the shared render-target dirty flag.
+struct RenderTargetClip {
+    /// Records `clip_right` and returns whether the targets must be looked up again for it.
+    bool Update(u32 clip_right) noexcept {
+        const bool moved = clip_right != right;
+        right = clip_right;
+        return moved;
+    }
+
+    u32 right = 0;
+};
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
                                          bool strict_size) noexcept;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -26,6 +25,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -41,6 +41,7 @@ namespace {
 std::atomic<u64> g_profile_submits{};
 std::atomic<u64> g_profile_renderpasses{};
 std::atomic<u64> g_profile_finishes{};
+std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
@@ -71,9 +72,10 @@ void ReportSubmitCounts() {
     }
     const double seconds = static_cast<double>(now - start) / 1e9;
     LOG_INFO(Render_Vulkan,
-             "Scheduler per second: {:.0f} submits, {:.0f} render passes, {:.0f} finishes "
-             "waiting {:.1f} ms",
+             "Scheduler per second: {:.0f} submits, {:.0f} empty flushes skipped, {:.0f} render "
+             "passes, {:.0f} finishes waiting {:.1f} ms",
              static_cast<double>(g_profile_submits.exchange(0)) / seconds,
+             static_cast<double>(g_profile_skipped_flushes.exchange(0)) / seconds,
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
@@ -110,25 +112,30 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
+      render_recorders{VideoCommon::GpuSplit::RenderThreadOn()},
+      buffer_arena{render_recorders && VideoCommon::GpuSplit::RenderSwitch("EDEN_NX2_BUFFER_ARENA")},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
+      upload_batch{std::make_unique<UploadBatch>()} {
 
-    if (Common::DkbFrameTrace::Enabled()) {
-        const auto physical = device.GetPhysical();
-        trace_timestamp_bits =
-            physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
-        trace_timestamp_period = physical.GetProperties().limits.timestampPeriod;
-        if (trace_timestamp_bits != 0 && trace_timestamp_bits <= 64 && trace_timestamp_period > 0) {
-            try {
-                trace_query_pool = device.GetLogical().CreateQueryPool({
-                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                    .queryCount = TraceMaxSubmissions * 2,
-                    .pipelineStatistics = 0,
-                });
-                trace_submissions.resize(TraceMaxSubmissions);
+    // The submission timestamps also feed the performance overlay's GPU %, so they exist
+    // without EDEN_DKB_FRAME_TRACE; nothing is written to them until a sample is asked for.
+    const auto physical = device.GetPhysical();
+    trace_timestamp_bits =
+        physical.GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
+    trace_timestamp_period = physical.GetProperties().limits.timestampPeriod;
+    if (trace_timestamp_bits != 0 && trace_timestamp_bits <= 64 && trace_timestamp_period > 0) {
+        try {
+            trace_query_pool = device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = TraceMaxSubmissions * 2,
+                .pipelineStatistics = 0,
+            });
+            trace_submissions.resize(TraceMaxSubmissions);
+            if (Common::DkbFrameTrace::Enabled()) {
                 trace_work_pool = device.GetLogical().CreateQueryPool({
                     .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                     .pNext = nullptr,
@@ -138,18 +145,44 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                     .pipelineStatistics = 0,
                 });
                 trace_work_items.resize(TraceMaxWork);
-            } catch (const vk::Exception& error) {
-                LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
+                trace_pass_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TraceMaxPasses,
+                    .pipelineStatistics = 0,
+                });
+                trace_pass_items.resize(TraceMaxPasses);
+                trace_pass_tails.resize(TraceMaxSubmissions);
             }
-        } else {
-            LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
-                     trace_timestamp_bits, trace_timestamp_period);
+            if (Common::DkbFrameTrace::GpuSitesEnabled()) {
+                trace_site_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TraceMaxSites + 1,
+                    .pipelineStatistics = 0,
+                });
+                trace_site_items.resize(TraceMaxSites + 1);
+            }
+        } catch (const vk::Exception& error) {
+            LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
         }
+    } else if (Common::DkbFrameTrace::Enabled()) {
+        LOG_INFO(Render_Vulkan, "DKB gpu_timestamp unsupported: valid_bits={} period_ns={}",
+                 trace_timestamp_bits, trace_timestamp_period);
     }
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
+}
+
+void Scheduler::JoinActiveRecorders(std::source_location site) {
+    VideoCommon::GpuSplit::JoinRender(site);
+    BufferArena::PlayPending();
 }
 
 Scheduler::~Scheduler() {
@@ -165,6 +198,7 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    JoinRecorders();
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -174,12 +208,20 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
+    submitted_serial = record_serial;
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     return signal_value;
 }
 
+void Scheduler::CountSkippedFlush() {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_skipped_flushes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool Scheduler::DeferFlush() {
+    JoinRecorders();
     // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
@@ -201,9 +243,34 @@ bool Scheduler::DeferFlush() {
 }
 
 void Scheduler::FlushDeferred() {
+    JoinRecorders();
     if (flush_pending) {
         Flush();
     }
+}
+
+bool Scheduler::IdleGpuAwaitsWork() {
+    // Mario Kart World: the back records ~1 ms of draws per 128-draw submission while the GPU
+    // sits idle, then what waits on that work (a command list copy, a fence-delayed semaphore
+    // release) waits for the GPU to run all of it. 100 us left the least of that wait among 50,
+    // 100 and 200 us.
+    static constexpr auto age = std::chrono::microseconds{100};
+    // Don't wait for a follower packet just to probe. A deferred clear belongs to the next pass.
+    if ((render_recorders && VideoCommon::GpuSplit::BackHasPendingRender()) || state.renderpass ||
+        deferred_clear.framebuffer || !RecordedSinceSubmit()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_flush < age || now < next_idle_gpu_check) {
+        return false;
+    }
+    // Rate-limit refresh attempts while the GPU stays busy.
+    next_idle_gpu_check = now + age;
+    const u64 last_submitted = CurrentTick() - 1;
+    if (!IsFree(last_submitted)) {
+        master_semaphore->Refresh();
+    }
+    return IsFree(last_submitted);
 }
 
 bool Scheduler::WaitSubmitted(u64 tick) {
@@ -238,6 +305,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
+    JoinRecorders();
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -245,12 +313,14 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
     // When finishing, we need to wait for the submission to have executed on the device.
+    const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
+    submitted_serial = record_serial;
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     if (profile) {
@@ -261,6 +331,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    JoinRecorders();
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -273,15 +344,43 @@ void Scheduler::WaitWorker() {
     std::scoped_lock el{execution_mutex};
 }
 
-void Scheduler::MarkFrameEnd(u64 frame) {
+Scheduler::FrameMark Scheduler::NextFrameMark() {
+    JoinRecorders();
     if (Common::DkbFrameTrace::Enabled()) {
-        Record([this, frame](vk::CommandBuffer) { trace_frame_end = frame; });
+        return FrameMark::Both;
     }
+    u32 marks = gpu_busy_marks.load(std::memory_order_relaxed);
+    if (marks == 0 ||
+        !gpu_busy_marks.compare_exchange_strong(marks, marks - 1, std::memory_order_relaxed)) {
+        return FrameMark::None;
+    }
+    return marks == 2 ? FrameMark::Start : FrameMark::End;
+}
+
+void Scheduler::MarkFrameEnd(u64 frame, FrameMark mark) {
+    JoinRecorders();
+    Record([this, frame, mark](vk::CommandBuffer) {
+        trace_frame_end = frame;
+        trace_frame_mark = mark;
+    });
+}
+
+std::optional<double> Scheduler::GpuBusyMs() const {
+    std::scoped_lock lock{gpu_busy_mutex};
+    if (!gpu_busy || std::chrono::steady_clock::now() - gpu_busy->taken > std::chrono::seconds{3}) {
+        return std::nullopt;
+    }
+    return gpu_busy->ms;
 }
 
 void Scheduler::DispatchWork() {
+    JoinRecorders();
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
+    }
+    if (uploads_pending) {
+        // The worker must receive everything recorded so far.
+        FlushUploads();
     }
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
@@ -299,6 +398,34 @@ void Scheduler::DispatchWork() {
     }
 }
 
+void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+    JoinRecorders();
+    if (VideoCommon::GpuSplit::check_owner) {
+        VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
+        BufferArena::CheckRecord("Scheduler::RecordUpload", std::source_location::current());
+    }
+    // Check each region so even a single upload larger than the capacity stays bounded, and
+    // overlapping regions within that upload cannot enter the same batch.
+    for (const VkBufferCopy& copy : copies) {
+        const std::span<const VkBufferCopy> region{&copy, 1};
+        if (uploads_pending && !upload_batch->CanAdd(src, dst, region)) {
+            FlushUploads();
+        }
+        upload_batch->Add(src, dst, region);
+        uploads_pending = true;
+    }
+}
+
+void Scheduler::FlushUploads() {
+    // Copy the vectors so the recording thread retains their capacity while the worker uses them.
+    auto command = [copies = upload_batch->copies, groups = upload_batch->groups](
+                       vk::CommandBuffer cmdbuf) { UploadBatch::Record(cmdbuf, copies, groups); };
+    upload_batch->copies.clear();
+    upload_batch->groups.clear();
+    uploads_pending = false;
+    Record(std::move(command));
+}
+
 void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass renderpass,
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
@@ -306,6 +433,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
@@ -388,6 +516,7 @@ void Scheduler::RealizeDeferredClear() {
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
                                 const VkClearValue& value) {
+    JoinRecorders();
     if (IsRenderPassActive()) {
         return false;
     }
@@ -402,6 +531,7 @@ bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
 }
 
 bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkClearValue& value) {
+    JoinRecorders();
     if (IsRenderPassActive()) {
         return false;
     }
@@ -416,6 +546,7 @@ bool Scheduler::DeferDepthStencilClear(const Framebuffer* framebuffer, const VkC
 }
 
 void Scheduler::FlushDeferredClear() {
+    JoinRecorders();
     if (deferred_clear.framebuffer == nullptr) {
         return;
     }
@@ -424,6 +555,7 @@ void Scheduler::FlushDeferredClear() {
 }
 
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
+    JoinRecorders();
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         return;
@@ -431,7 +563,14 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
+    // A draw continues the active pass whenever the same framebuffer and area are bound. The
+    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
+    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
+    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
+    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
+    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
+    // so it is the correct identity to compare.
+    if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;
@@ -445,6 +584,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
+    JoinRecorders();
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -452,6 +592,7 @@ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location lo
 }
 
 bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
+    JoinRecorders();
     if (state.graphics_pipeline == pipeline) {
         if (pipeline && pipeline->UsesExtendedDynamicState() &&
             state.needs_state_enable_refresh) {
@@ -478,6 +619,7 @@ bool Scheduler::UpdateGraphicsPipeline(GraphicsPipeline* pipeline) {
 }
 
 bool Scheduler::UpdateRescaling(bool is_rescaling, bool mesh_layout) {
+    JoinRecorders();
     if (state.rescaling_defined && is_rescaling == state.is_rescaling &&
         mesh_layout == state.mesh_layout) {
         return false;
@@ -489,6 +631,7 @@ bool Scheduler::UpdateRescaling(bool is_rescaling, bool mesh_layout) {
 }
 
 bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
+    JoinRecorders();
     if (state.descriptor_buffer_bound && descriptor_chunk == state.descriptor_buffer_chunk) {
         return false;
     }
@@ -500,6 +643,8 @@ bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
+    const VideoCommon::StutterTrace::ThreadScope stutter_thread{
+        VideoCommon::StutterTrace::Thread::Worker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
 
@@ -521,10 +666,13 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             std::unique_lock lk{queue_mutex};
 
             // Wait for work.
-            event_cv.wait(lk, stop_token, [&] {
-                worker_waiting = !TryPopQueue(work);
-                return !worker_waiting;
-            });
+            {
+                const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::WorkerIdle};
+                event_cv.wait(lk, stop_token, [&] {
+                    worker_waiting = !TryPopQueue(work);
+                    return !worker_waiting;
+                });
+            }
             worker_waiting = false;
 
             // If we've been asked to stop, we're done.
@@ -554,6 +702,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Recycle the chunk back to the reserve.
             chunk_reserve.emplace_back(std::move(work));
         }
+        VideoCommon::Nx2Profile::Report("Vulkan worker");
     }
 }
 
@@ -572,7 +721,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
-    if (trace_query_pool && !trace_gpu_failed) {
+    if (trace_query_pool && !trace_gpu_failed && (trace_gpu_pending || trace_gpu_sampling)) {
         TraceGpuSubmission();
     }
 }
@@ -594,7 +743,8 @@ void Scheduler::TraceShader(u64 hash, u32 stage) {
 }
 
 void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
-    if (!trace_query_pool) {
+    JoinRecorders();
+    if (!trace_work_pool) {
         return;
     }
     Record([this, hashes](vk::CommandBuffer) {
@@ -605,11 +755,18 @@ void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
         for (u32 stage = 0; stage < hashes.size(); ++stage) {
             TraceShader(hashes[stage], stage);
         }
+        ++trace_pass.draws;
+        const auto vertex = std::ranges::find_if(hashes.begin(), hashes.end() - 1,
+                                                 [](u64 hash) { return hash != 0; });
+        if (vertex != hashes.end() - 1) {
+            TracePassShaders(*vertex, static_cast<u32>(vertex - hashes.begin()), hashes[5]);
+        }
     });
 }
 
 void Scheduler::TraceComputePipeline(u64 hash) {
-    if (!trace_query_pool) {
+    JoinRecorders();
+    if (!trace_work_pool) {
         return;
     }
     Record([this, hash](vk::CommandBuffer) {
@@ -618,7 +775,107 @@ void Scheduler::TraceComputePipeline(u64 hash) {
         }
         ++trace_work.dispatch_attempts;
         TraceShader(hash, 6);
+        ++trace_pass.dispatches;
+        TracePassShaders(hash, 6, 0);
     });
+}
+
+void Scheduler::TracePassShaders(u64 hash, u32 stage, u64 fragment_hash) {
+    for (u32 i = 0; i < trace_pass.num_shaders; ++i) {
+        const auto& shaders = trace_pass.shaders[i];
+        if (shaders.hash == hash && shaders.fragment_hash == fragment_hash) {
+            return;
+        }
+    }
+    if (trace_pass.num_shaders == trace_pass.shaders.size()) {
+        ++trace_pass.untracked_uses;
+        return;
+    }
+    trace_pass.shaders[trace_pass.num_shaders++] = {hash, fragment_hash, stage};
+}
+
+void Scheduler::TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent) {
+    if (!trace_gpu_recording || !trace_pass_pool || trace_pass_count == TraceMaxPasses) {
+        return;
+    }
+    trace_pass.submission = trace_gpu_count;
+    trace_pass.extent = extent;
+    trace_pass_items[trace_pass_count] = trace_pass;
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_pass_pool,
+                          trace_pass_count);
+    ++trace_pass_count;
+    trace_pass = {};
+}
+
+void Scheduler::ReportPassTimes(const std::vector<u64>& submission_begin,
+                                const std::vector<u64>& submission_end) {
+    if (!trace_pass_pool) {
+        return;
+    }
+    const u32 count = trace_pass_count;
+    trace_pass_count = 0;
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    std::vector<Result> results(count);
+    if (count != 0 &&
+        device.GetLogical().GetQueryResults(
+            *trace_pass_pool, 0, count, results.size() * sizeof(Result), results.data(),
+            sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) !=
+            VK_SUCCESS) {
+        return;
+    }
+    const auto to_ms = [this](u64 begin, u64 end) {
+        return static_cast<double>(
+                   Common::DkbFrameTrace::TimestampDelta(begin, end, trace_timestamp_bits)) *
+               trace_timestamp_period / 1e6;
+    };
+    struct Segment {
+        double ms;
+        const PassTrace* pass;
+        bool tail;
+    };
+    std::vector<Segment> segments;
+    double total_ms{};
+    u32 next = 0;
+    for (u32 submission = 0; submission < submission_end.size(); ++submission) {
+        u64 previous = submission_begin[submission];
+        for (; next < count && trace_pass_items[next].submission == submission; ++next) {
+            if (results[next].available == 0) {
+                continue;
+            }
+            const double ms = to_ms(previous, results[next].timestamp);
+            segments.push_back({ms, &trace_pass_items[next], false});
+            total_ms += ms;
+            previous = results[next].timestamp;
+        }
+        const double ms = to_ms(previous, submission_end[submission]);
+        segments.push_back({ms, &trace_pass_tails[submission], true});
+        total_ms += ms;
+    }
+    std::ranges::sort(segments, std::greater<>{}, &Segment::ms);
+    LOG_INFO(Render_Vulkan, "DKB gpu_passes renderer_frame={} passes={}{} timed_ms={:.3f}",
+             trace_sample_frame, count, count == TraceMaxPasses ? " (full)" : "", total_ms);
+    for (size_t i = 0; i < segments.size() && i < 16; ++i) {
+        const auto& [ms, pass, tail] = segments[i];
+        std::string shaders;
+        for (u32 s = 0; s < pass->num_shaders; ++s) {
+            const auto& shader = pass->shaders[s];
+            shaders += fmt::format("{}s{}:{:016x}", shaders.empty() ? "" : ",", shader.stage,
+                                   shader.hash);
+            if (shader.fragment_hash != 0) {
+                shaders += fmt::format("+s5:{:016x}", shader.fragment_hash);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DKB gpu_pass {:.3f}ms submission={} {} draws={} dispatches={} shaders={} "
+                 "untracked_uses={}",
+                 ms, pass->submission,
+                 tail ? std::string{"after the last pass"}
+                      : fmt::format("pass {}x{}", pass->extent.width, pass->extent.height),
+                 pass->draws, pass->dispatches, shaders, pass->untracked_uses);
+    }
 }
 
 void Scheduler::ReportWorkTimes() {
@@ -686,6 +943,127 @@ void Scheduler::ReportWorkTimes() {
              trace_sample_frame, count, total_ms, slowest);
 }
 
+void Scheduler::RecordSiteMarker(std::source_location location) {
+    auto marker = [this, file = location.file_name(),
+                   line = static_cast<u32>(location.line())](vk::CommandBuffer cmdbuf,
+                                                             vk::CommandBuffer) {
+        TraceSite(cmdbuf, file, line);
+    };
+    if (!chunk->Record(marker)) {
+        DispatchWork();
+        (void)chunk->Record(marker);
+    }
+}
+
+void Scheduler::TraceSite(vk::CommandBuffer cmdbuf, const char* file, u32 line) {
+    if (!trace_gpu_recording || !trace_site_pool || trace_site_count > TraceMaxSites) {
+        return;
+    }
+    // One query past the sites marks where commands stop having markers (file nullptr), so
+    // every traced site keeps only its own time.
+    if (trace_site_count == TraceMaxSites) {
+        file = nullptr;
+        line = 0;
+    }
+    trace_site_items[trace_site_count] = {file, line, trace_gpu_count};
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_site_pool,
+                          trace_site_count);
+    ++trace_site_count;
+}
+
+void Scheduler::ReportSiteTimes(const std::vector<u64>& submission_begin,
+                                const std::vector<u64>& submission_end) {
+    const u32 count = trace_site_count;
+    if (count == 0 || submission_begin.empty()) {
+        return;
+    }
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    std::vector<Result> results(count);
+    const auto result = device.GetLogical().GetQueryResults(
+        *trace_site_pool, 0, count, results.size() * sizeof(Result), results.data(),
+        sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS) {
+        return;
+    }
+    const auto to_ms = [this](u64 begin, u64 end) {
+        return static_cast<double>(
+                   Common::DkbFrameTrace::TimestampDelta(begin, end, trace_timestamp_bits)) *
+               trace_timestamp_period / 1e6;
+    };
+    struct Totals {
+        double ms{};
+        double max_ms{};
+        u32 count{};
+    };
+    // Keyed by file name and line: file_name() is static storage, but one header compiled in
+    // several translation units has a pointer per unit. Line 0 is the submission start entry.
+    using SiteKey = std::pair<std::string_view, u32>;
+    std::map<SiteKey, Totals> by_site;
+    const auto add = [&by_site](const SiteKey& site, double ms) {
+        Totals& totals = by_site[site];
+        totals.ms += ms;
+        totals.max_ms = std::max(totals.max_ms, ms);
+        ++totals.count;
+    };
+    const auto site_key = [](const SiteTrace& site) {
+        std::string_view file{site.file};
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        return SiteKey{file, site.line};
+    };
+    double total_ms{};
+    u32 previous_submission = ~0U;
+    for (u32 i = 0; i < count; ++i) {
+        const SiteTrace& site = trace_site_items[i];
+        if (site.submission >= submission_end.size() || results[i].available == 0) {
+            continue;
+        }
+        if (site.submission != previous_submission) {
+            // Upload command buffer and anything before the first marker of the submission.
+            const double ms = to_ms(submission_begin[site.submission], results[i].timestamp);
+            add(SiteKey{"(submission start/uploads)", 0}, ms);
+            total_ms += ms;
+            previous_submission = site.submission;
+        }
+        const bool next_in_submission = i + 1 < count &&
+                                        trace_site_items[i + 1].submission == site.submission &&
+                                        results[i + 1].available != 0;
+        const u64 end = next_in_submission ? results[i + 1].timestamp
+                                           : submission_end[site.submission];
+        const double ms = to_ms(results[i].timestamp, end);
+        add(site.file == nullptr ? SiteKey{"(after the marker limit)", 0} : site_key(site), ms);
+        total_ms += ms;
+    }
+    // Submissions after the one that ran out of markers have none: all of their time goes to the
+    // same entry.
+    if (count > TraceMaxSites) {
+        for (u32 s = trace_site_items[TraceMaxSites].submission + 1; s < submission_end.size();
+             ++s) {
+            const double ms = to_ms(submission_begin[s], submission_end[s]);
+            add(SiteKey{"(after the marker limit)", 0}, ms);
+            total_ms += ms;
+        }
+    }
+    std::vector<std::pair<SiteKey, Totals>> sorted(by_site.begin(), by_site.end());
+    std::ranges::sort(sorted, std::greater<>{},
+                      [](const auto& entry) { return entry.second.ms; });
+    LOG_INFO(Render_Vulkan,
+             "DKB gpu_sites renderer_frame={} markers={}{} attributed_ms={:.3f} sites={}",
+             trace_sample_frame, count, count > TraceMaxSites ? " (full)" : "", total_ms,
+             sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 25; ++i) {
+        const auto& [site, totals] = sorted[i];
+        const auto& [file, line] = site;
+        LOG_INFO(Render_Vulkan, "DKB gpu_site {:.3f}ms {}x max {:.3f}ms {}", totals.ms,
+                 totals.count, totals.max_ms,
+                 line == 0 ? std::string{file} : fmt::format("{}:{}", file, line));
+    }
+}
+
 void Scheduler::TraceGpuSubmission() {
     if (trace_gpu_pending) {
         master_semaphore->Refresh();
@@ -712,6 +1090,9 @@ void Scheduler::TraceGpuSubmission() {
         }
         double total_ms{};
         std::array<std::pair<double, u32>, 4> slowest{};
+        // Each submission's start and end, in ticks after the first one started.
+        std::vector<std::pair<u64, u64>> intervals;
+        intervals.reserve(trace_gpu_count);
         for (u32 i = 0; i < trace_gpu_count * 2; i += 2) {
             if (results[i].available == 0 || results[i + 1].available == 0) {
                 return;
@@ -724,21 +1105,46 @@ void Scheduler::TraceGpuSubmission() {
                 slowest.back() = {duration_ms, i / 2};
                 std::ranges::sort(slowest, std::greater<>{});
             }
+            const u64 start = Common::DkbFrameTrace::TimestampDelta(
+                results[0].timestamp, results[i].timestamp, trace_timestamp_bits);
+            intervals.emplace_back(start, start + ticks);
+        }
+        // Busy time is the union of the submissions: idle gaps between them are not counted,
+        // and overlapping submissions are counted once.
+        std::ranges::sort(intervals);
+        u64 busy_ticks{};
+        u64 busy_start = intervals.front().first;
+        u64 busy_end = intervals.front().second;
+        for (const auto& [start, end] : intervals) {
+            if (start > busy_end) {
+                busy_ticks += busy_end - busy_start;
+                busy_start = start;
+            }
+            busy_end = std::max(busy_end, end);
+        }
+        busy_ticks += busy_end - busy_start;
+        const double busy_ms = static_cast<double>(busy_ticks) * trace_timestamp_period / 1e6;
+        if (trace_gpu_publish && trace_gpu_skipped == 0) {
+            std::scoped_lock lock{gpu_busy_mutex};
+            gpu_busy = GpuBusySample{busy_ms, std::chrono::steady_clock::now()};
         }
         const double span_ms = trace_gpu_skipped == 0
             ? static_cast<double>(Common::DkbFrameTrace::TimestampDelta(
                   results[0].timestamp, results[trace_gpu_count * 2 - 1].timestamp,
                   trace_timestamp_bits)) * trace_timestamp_period / 1e6
             : -1.0;
-        LOG_INFO(Render_Vulkan,
-                 "DKB gpu_frame renderer_frame={} last_submission_tick={} "
-                 "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} "
-                 "measured_submissions={} dropped_submissions={} "
-                 "valid_bits={} period_ns={}",
-                 trace_sample_frame, trace_gpu_tick, span_ms, total_ms, trace_gpu_count,
-                 trace_gpu_skipped, trace_timestamp_bits, trace_timestamp_period);
+        if (Common::DkbFrameTrace::Enabled()) {
+            LOG_INFO(Render_Vulkan,
+                     "DKB gpu_frame renderer_frame={} last_submission_tick={} "
+                     "gpu_frame_span_ms={:.3f} gpu_submission_sum_ms={:.3f} gpu_busy_ms={:.3f} "
+                     "measured_submissions={} dropped_submissions={} "
+                     "valid_bits={} period_ns={}",
+                     trace_sample_frame, trace_gpu_tick, span_ms, total_ms, busy_ms,
+                     trace_gpu_count, trace_gpu_skipped, trace_timestamp_bits,
+                     trace_timestamp_period);
+        }
         for (const auto& [duration_ms, index] : slowest) {
-            if (duration_ms < 10.0) {
+            if (duration_ms < 10.0 || !Common::DkbFrameTrace::Enabled()) {
                 continue;
             }
             const auto& work = trace_submissions[index];
@@ -755,6 +1161,18 @@ void Scheduler::TraceGpuSubmission() {
                      work.dispatch_attempts, shaders, work.untracked_uses);
         }
         ReportWorkTimes();
+        if (trace_gpu_skipped == 0) {
+            std::vector<u64> submission_begin(trace_gpu_count);
+            std::vector<u64> submission_end(trace_gpu_count);
+            for (u32 i = 0; i < trace_gpu_count; ++i) {
+                submission_begin[i] = results[i * 2].timestamp;
+                submission_end[i] = results[i * 2 + 1].timestamp;
+            }
+            ReportSiteTimes(submission_begin, submission_end);
+            ReportPassTimes(submission_begin, submission_end);
+        }
+        trace_site_count = 0;
+        trace_pass_count = 0;
         trace_gpu_tick = 0;
         trace_gpu_count = 0;
         trace_gpu_skipped = 0;
@@ -769,12 +1187,25 @@ void Scheduler::TraceGpuSubmission() {
         // Draws are timed inside render passes, where queries cannot be reset.
         current_upload_cmdbuf.ResetQueryPool(*trace_work_pool, 0, TraceMaxWork * 2);
     }
+    if (trace_gpu_count == 0 && trace_site_pool) {
+        current_upload_cmdbuf.ResetQueryPool(*trace_site_pool, 0, TraceMaxSites + 1);
+        trace_site_count = 0;
+    }
+    if (trace_gpu_count == 0 && trace_pass_pool) {
+        current_upload_cmdbuf.ResetQueryPool(*trace_pass_pool, 0, TraceMaxPasses);
+        trace_pass_count = 0;
+        trace_pass = {};
+    }
     current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *trace_query_pool,
                                         trace_gpu_count * 2);
     trace_gpu_recording = true;
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    if (uploads_pending) {
+        // Keep the copies in the tick that protects their staging regions and buffer lifetimes.
+        FlushUploads();
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
@@ -799,13 +1230,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             trace_gpu_tick = signal_value;
             trace_work.tick = signal_value;
             trace_submissions[trace_gpu_count] = trace_work;
+            if (trace_pass_pool) {
+                trace_pass.submission = trace_gpu_count;
+                trace_pass_tails[trace_gpu_count] = trace_pass;
+            }
             ++trace_gpu_count;
             trace_gpu_recording = false;
         } else if (trace_gpu_sampling) {
             ++trace_gpu_skipped;
         }
-        if (trace_query_pool) {
+        if (trace_work_pool) {
             trace_work = {};
+            trace_pass = {};
         }
         cmdbuf.End();
 
@@ -826,7 +1262,6 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             break;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
         default:
             vk::Check(result);
             break;
@@ -835,8 +1270,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             if (trace_gpu_sampling) {
                 trace_gpu_pending = true;
                 trace_gpu_sampling = false;
+                // A start mark while sampling means the end mark was lost: the sample spans
+                // more than one frame.
+                trace_gpu_publish = trace_frame_mark != FrameMark::Start;
             }
             if (trace_query_pool && !trace_gpu_failed && !trace_gpu_pending &&
+                trace_frame_mark != FrameMark::End &&
                 trace_gpu_rate.Ready(std::chrono::steady_clock::now())) {
                 trace_sample_frame = trace_frame_end + 1;
                 trace_gpu_sampling = true;
@@ -854,6 +1293,7 @@ void Scheduler::AllocateNewContext() {
 }
 
 void Scheduler::InvalidateState() {
+    JoinRecorders();
     ++recording_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
@@ -864,7 +1304,10 @@ void Scheduler::InvalidateState() {
 void Scheduler::EndPendingOperations() {
     // Pause, don't reset: a submission can land between a guest's counter reset and its report,
     // and resetting here would drop the samples counted so far (the report then reads too low).
-    query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    // Tests submit compute passes with no query cache.
+    if (query_cache) {
+        query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    }
     EndRenderPass();
 }
 
@@ -877,6 +1320,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        ++render_pass_serial;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
@@ -889,7 +1333,7 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
-        Record([num_images = num_renderpass_images,
+        Record([this, render_area = state.render_area, num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
                        has_transform_feedback = device.IsExtTransformFeedbackSupported()](
@@ -929,6 +1373,7 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
+            TracePassEnd(cmdbuf, render_area);
             cmdbuf.EndRenderPass();
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,

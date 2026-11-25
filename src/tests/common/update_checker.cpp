@@ -53,6 +53,27 @@ TEST_CASE("Lichii ignores dev builds and malformed release tags", "[updater]") {
     CHECK_FALSE(UpdateChecker::SelectUpdate(invalid, "build-70", "windows-x86_64"));
 }
 
+TEST_CASE("Only builds with a release tag and platform compare against releases", "[updater]") {
+    CHECK(UpdateChecker::IsReleaseBuild("build-71", "windows-x86_64"));
+    CHECK(UpdateChecker::IsReleaseBuild("build-260", "linux-x86_64-pgo"));
+    CHECK_FALSE(UpdateChecker::IsReleaseBuild("build-71", ""));
+    const std::string tag =
+        GENERATE("", "nx2", "abc1234567-nx2", "build-", "build-0", "build-71junk");
+    CHECK_FALSE(UpdateChecker::IsReleaseBuild(tag, "windows-x86_64"));
+}
+
+TEST_CASE("A build newer than every release is never offered an older one", "[updater]") {
+    const auto releases = std::array{
+        MakeRelease("build-250", "lichii-windows-x86_64.zip"),
+        MakeRelease("build-249", "lichii-windows-x86_64.zip"),
+    };
+    CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "build-260", "windows-x86_64"));
+    CHECK_FALSE(UpdateChecker::SelectUpdate(releases, "build-250", "windows-x86_64"));
+    const auto update = UpdateChecker::SelectUpdate(releases, "build-249", "windows-x86_64");
+    REQUIRE(update);
+    CHECK(update->tag == "build-250");
+}
+
 TEST_CASE("Lichii selects only the matching platform and PGO variant", "[updater]") {
     const std::string platform =
         GENERATE("windows-x86_64", "windows-x86_64-pgo", "linux-x86_64", "linux-x86_64-pgo",
@@ -132,6 +153,28 @@ TEST_CASE("Linux installs only get the package they were installed from", "[upda
     const auto appimage_only = MakeRelease("build-72", "lichii-linux-x86_64.AppImage");
     CHECK(appimage_only.GetPlatformAssets("linux-x86_64", Common::Net::LinuxPackage::Archive)
               .empty());
+}
+
+TEST_CASE("Linux ARM64 PGO installs update to the newer standard package", "[updater]") {
+    using Common::Net::LinuxPackage;
+    const auto package = GENERATE(LinuxPackage::AppImage, LinuxPackage::Archive);
+    const std::string extension = package == LinuxPackage::AppImage ? ".AppImage" : ".tar.gz";
+    const std::string other_extension =
+        package == LinuxPackage::AppImage ? ".tar.gz" : ".AppImage";
+    const auto releases = std::array{
+        MakeRelease("build-501", "lichii-linux-aarch64-pgo" + extension),
+        MakeRelease("build-502", "lichii-linux-aarch64" + extension),
+        MakeRelease("build-503", "lichii-linux-x86_64-pgo" + extension),
+        MakeRelease("build-504", "lichii-linux-aarch64" + other_extension),
+    };
+    const auto update = UpdateChecker::SelectUpdate(releases, "build-500", "linux-aarch64-pgo",
+                                                    package);
+    REQUIRE(update);
+    CHECK(update->tag == "build-502");
+    const auto assets = update->GetPlatformAssets("linux-aarch64-pgo", package);
+    REQUIRE(assets.size() == 1);
+    CHECK(assets[0].name == "Standard");
+    CHECK(assets[0].filename == "lichii-linux-aarch64" + extension);
 }
 
 TEST_CASE("Asset digest and size come from the release JSON", "[updater]") {

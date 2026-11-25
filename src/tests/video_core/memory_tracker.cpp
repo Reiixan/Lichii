@@ -604,6 +604,30 @@ TEST_CASE("Consumed read traps rearm on the next GPU write", "[cpu_readback][rea
     REQUIRE(traps.Arm(c, PAGE * 2));
 }
 
+TEST_CASE("A GPU write notifies the core of its unarmed pages only", "[cpu_readback][read_traps]") {
+    VideoCommon::ReadTrapTracker traps;
+    std::vector<Range> parts;
+    const auto collect = [&](u64 address, u64 size) { parts.emplace_back(address, size); };
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE * 4}});
+
+    // CPU reads consumed the second and the last page: a rewrite of the buffer arms just those.
+    traps.Subtract(c + PAGE, PAGE);
+    traps.Subtract(c + PAGE * 3, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c + PAGE, PAGE}, {c + PAGE * 3, PAGE}});
+
+    // A write that also reaches past the armed range notifies the new part.
+    traps.Subtract(c, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE}, {c + PAGE * 4, PAGE * 2}});
+    parts.clear();
+    REQUIRE_FALSE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts.empty());
+}
+
 TEST_CASE("MemoryTracker: a GPU rewrite needs a fresh CPU readback", "[cpu_readback]") {
     RasterizerInterface rasterizer;
     MemoryTracker tracker{rasterizer};
@@ -676,6 +700,29 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 3);
 }
 
+TEST_CASE("MemoryTracker: engine writes leave their pages tracked", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    const auto update_calls = rasterizer.UpdateCalls();
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE(memory_track->ModifiedCpuRegion(c, WORD * 2) == Range{c + PAGE, c + PAGE * 3});
+
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE_FALSE(memory_track->IsRegionCpuModified(c, WORD * 2));
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE);
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 1);
+    REQUIRE(rasterizer.Count(c + PAGE) == 0);
+}
+
 TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);
@@ -713,8 +760,45 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
 
     // small ranges should be accepted and not crash
     std::vector<std::pair<DAddr, size_t>> ranges;
-    ranges.emplace_back(0, Core::Memory::YUZU_PAGESIZE);
-    ranges.emplace_back(Core::Memory::YUZU_PAGESIZE, Core::Memory::YUZU_PAGESIZE);
+    ranges.emplace_back(0, Core::Memory::LICHII_PAGESIZE);
+    ranges.emplace_back(Core::Memory::LICHII_PAGESIZE, Core::Memory::LICHII_PAGESIZE);
     manager.UpdatePagesCachedBatch(ranges, 1);
     SUCCEED("UpdatePagesCachedBatch executed without error");
+}
+
+TEST_CASE("MemoryTracker: Deferred page caching untracks in order and tracks at once",
+          "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->UnmarkRegionAsCpuModified(c, WORD);
+    REQUIRE(rasterizer.Count(c + PAGE) == 1);
+    const size_t calls = rasterizer.UpdateCalls();
+
+    VideoCommon::DeferredPageCaching deferred;
+    VideoCommon::t_deferred_page_caching = &deferred;
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    memory_track->UnmarkRegionAsCpuModified(c + PAGE, PAGE);
+    memory_track->MarkRegionAsCpuModified(c + PAGE * 3, PAGE);
+    VideoCommon::t_deferred_page_caching = nullptr;
+
+    // The words changed at once; the tracker hears of the untracking only when the thread applies
+    // it. Tracking the page again (which deferring callers never do; it asserts) applies at once,
+    // so the page stays protected throughout.
+    REQUIRE(rasterizer.UpdateCalls() == calls + 1);
+    REQUIRE(memory_track->ModifiedCpuRegion(c, WORD) == Range{c + PAGE * 3, c + PAGE * 4});
+    REQUIRE(rasterizer.Count(c + PAGE) == 2);
+    REQUIRE(rasterizer.Count(c + PAGE * 3) == 1);
+
+    deferred.ApplyAll();
+    REQUIRE(deferred.Empty());
+    REQUIRE(rasterizer.UpdateCalls() == calls + 3);
+    REQUIRE(rasterizer.Count(c + PAGE) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE * 3) == 0);
+    const auto& list = rasterizer.UpdateCallsList();
+    REQUIRE(list[list.size() - 3] == std::tuple{c + PAGE, PAGE, 1});
+    REQUIRE(list[list.size() - 2] == std::tuple{c + PAGE, PAGE, -1});
+    REQUIRE(list[list.size() - 1] == std::tuple{c + PAGE * 3, PAGE, -1});
+
+    deferred.ApplyAll();
+    REQUIRE(rasterizer.UpdateCalls() == calls + 3);
 }

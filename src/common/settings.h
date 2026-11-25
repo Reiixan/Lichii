@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -65,6 +64,10 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -255,13 +258,11 @@ struct Values {
 
     // Cpu
     SwitchableSetting<CpuBackend, true> cpu_backend{linkage,
-#ifdef HAS_NCE
-                                                    CpuBackend::Nce,
-#else
                                                     CpuBackend::Dynarmic,
-#endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
+#ifdef HAS_HYPERVISOR
+                                                    CpuBackend::Hypervisor,
+#elif defined(HAS_NCE)
                                                     CpuBackend::Nce,
 #else
                                                     CpuBackend::Dynarmic,
@@ -339,6 +340,18 @@ struct Values {
                                                                 linkage, true, "cpuopt_unsafe_ignore_global_monitor", Category::CpuUnsafe};
 
     // Renderer
+    // Off: the game always renders SDR. On: HDR whenever the surface offers an HDR format.
+    // Auto: HDR while the monitor showing the game runs in HDR, where the host can tell (Windows;
+    // elsewhere SDR). The game is told HDR only while the swapchain really presents HDR.
+    SwitchableSetting<HdrMode> hdr_mode{linkage, HdrMode::Off, "hdr_mode", Category::Renderer};
+    // HDR10: 10-bit PQ BT.2020 swapchain. scRGB: 16-bit float linear BT.709, for displays or
+    // drivers that band with 10-bit (reported on NVIDIA in fullscreen).
+    SwitchableSetting<HdrSwapchain> hdr_swapchain{linkage, HdrSwapchain::Hdr10, "hdr_swapchain",
+                                                  Category::Renderer};
+    SwitchableSetting<u16, true> hdr_reference_white{linkage, 0, 0, 1000, "hdr_reference_white",
+                                                  Category::Renderer, Specialization::Scalar};
+    SwitchableSetting<u16, true> hdr_peak_luminance{linkage, 0, 0, 10000, "hdr_peak_luminance",
+                                                 Category::Renderer, Specialization::Scalar};
     SwitchableSetting<RendererBackend, true> renderer_backend{linkage,
 #if defined(__sun__) || defined(__managarm__)
         RendererBackend::OpenGL_GLSL,
@@ -398,8 +411,36 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
+    // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    SwitchableSetting<u16, true> frame_rate_limit{linkage,
+                                                  60,
+                                                  30,
+                                                  240,
+                                                  "nx2_frame_rate_limit",
+                                                  Category::Renderer,
+                                                  Specialization::Scalar,
+                                                  true,
+                                                  false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
+                                                             NvidiaDlssQuality::Automatic,
+                                                             "nvidia_dlss_quality",
+                                                             Category::Renderer,
+                                                             Specialization::Default,
+                                                             true,
+                                                             true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{linkage,
+                                                           NvidiaDlssPreset::M,
+                                                           "nvidia_dlss_preset",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+    SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
+    SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -448,7 +489,7 @@ struct Values {
                                       Specialization::Default, true, false};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,
-                                                   FrameGenType::Fsr3,
+                                                   FrameGenType::OpticalFlow,
                                                    "frame_gen_type",
                                                    Category::Renderer,
                                                    Specialization::Default,
@@ -510,6 +551,15 @@ struct Values {
                                                         false,
                                                         &frame_gen};
 
+    SwitchableSetting<bool> frame_gen_flyhigh_protect_hud{linkage,
+                                                          true,
+                                                          "frame_gen_flyhigh_protect_hud",
+                                                          Category::Renderer,
+                                                          Specialization::Default,
+                                                          true,
+                                                          false,
+                                                          &frame_gen};
+
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
 
@@ -567,6 +617,20 @@ struct Values {
                                                                  Specialization::Default,
                                                                  true,
                                                                  true};
+
+    // How much of a native (Switch 2) compute program's storage binding a dispatch marks
+    // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
+    // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
+    // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
+    // unknown). Full: the whole binding (the behaviour before the store extent).
+    SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
+        linkage,
+        NativeComputeWriteMark::Auto,
+        "native_compute_write_mark",
+        Category::RendererAdvanced,
+        Specialization::Default,
+        true,
+        true};
 
     SwitchableSetting<VramUsageMode, true> vram_usage_mode{linkage,
                                                            VramUsageMode::Conservative,
@@ -626,7 +690,7 @@ struct Values {
         Specialization::Default};
 
     SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
-                                                           NativeAsyncDraws::Wait,
+                                                           NativeAsyncDraws::Bounded,
                                                            "native_async_draws",
                                                            Category::RendererAdvanced,
                                                            Specialization::Default,
@@ -643,6 +707,26 @@ struct Values {
                                                          true,
                                                          true};
 
+    SwitchableSetting<bool> skip_unbuilt_mesh_draws{linkage, false, "skip_unbuilt_mesh_draws",
+                                                    Category::RendererAdvanced};
+
+    // Precache shaders before the game starts: the compute programs in the game files are built on
+    // the loading screen, so the driver's cache holds them before the game first uses them.
+    // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
+    // asks, as Off.
+    SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
+                                                        PrecacheShaders::Off,
+                                                        "precache_shaders",
+                                                        Category::RendererAdvanced,
+                                                        Specialization::Default,
+                                                        true,
+                                                        true};
+
+    // Build every cached graphics pipeline while the game loads, not only those recent sessions
+    // used, and keep them built, up to the pipelines kept in memory (a quarter of the RAM).
+    SwitchableSetting<bool> build_all_cached_shaders{linkage, false, "build_all_cached_shaders",
+                                                     Category::RendererAdvanced};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
@@ -651,8 +735,19 @@ struct Values {
 
     // Mario Kart World: select a fixed or dynamic in-game frame-rate mode (loader/nso.cpp).
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps{linkage, false, "mkw_60fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> mkw_60fps_fallback{linkage, true, "mkw_60fps_fallback",
+                                               Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
+
+    // Hyrule Warriors: Age of Imprisonment: 30 FPS at normal game speed while 60 can't be held,
+    // or always (core/hle/service/nx2_frame_interval.h).
+    SwitchableSetting<bool> hyrule_dynamic_fps{linkage, false, "hyrule_dynamic_fps",
+                                               Category::RendererAdvanced, Specialization::Default,
+                                               true, true};
+    SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced,
+                                         Specialization::Default, true, true};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
@@ -673,6 +768,12 @@ struct Values {
                                                   Specialization::Default,
                                                   true,
                                                   true};
+
+    // The GPU render thread (video_core/gpu_split.cpp, the render follower): records Vulkan
+    // commands off the GPU back thread. Experimental, so off by default; EDEN_NX2_RENDER_FOLLOWER
+    // overrides it either way.
+    SwitchableSetting<bool> render_thread{linkage, false, "render_thread",
+                                          Category::RendererAdvanced};
 
 #ifdef __ANDROID__
     SwitchableSetting<bool> use_optimized_vertex_buffers{linkage,
@@ -714,7 +815,7 @@ struct Values {
     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
                                             Category::RendererHacks};
 
-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
@@ -738,7 +839,7 @@ struct Values {
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
 
-    SwitchableSetting<bool> pin_gpu_threads{linkage, false, "pin_gpu_threads",
+    SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
                                             Category::RendererHacks};
 
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
@@ -767,6 +868,9 @@ struct Values {
                                                        true,
 #endif
                                                        "vertex_input_dynamic_state", Category::RendererExtensions};
+
+    SwitchableSetting<MeshShaderMode> mesh_shaders{linkage, MeshShaderMode::Automatic,
+                                                   "mesh_shaders", Category::RendererExtensions};
 
     Setting<bool> renderer_debug{linkage, false, "debug", Category::RendererDebug};
     Setting<bool> renderer_shader_feedback{linkage, false, "shader_feedback",
@@ -857,6 +961,20 @@ struct Values {
                                               Category::Controls};
     SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
                                                        Category::Controls};
+    // Only tested on Windows so far; on Linux (PipeWire) the haptics play through the speaker
+    Setting<bool> enable_dualsense_haptics{linkage,
+#ifdef _WIN32
+                                           true,
+#else
+                                           false,
+#endif
+                                           "enable_dualsense_haptics", Category::Controls};
+    Setting<bool> rumble_frequency_mapping{linkage, false, "rumble_frequency_mapping",
+                                           Category::Controls};
+    // Percent of each side's light rumble also played on the trigger motors, where a controller
+    // has them; 0 is off
+    Setting<u8, true> trigger_rumble_strength{linkage, 0, 0, 100, "trigger_rumble_strength",
+                                              Category::Controls};
 
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
@@ -985,11 +1103,39 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
                                            Category::Network};
     SwitchableSetting<bool> airplane_mode{linkage, true, "airplane_mode", Category::Network};
+    Setting<bool> lan_play{linkage, false, "lan_play", Category::Network};
+    Setting<bool> nextendo_enabled{linkage, false, "nextendo_enabled", Category::Network};
+    // Replaces the current user's nickname and icon with the Nextendo account's.
+    Setting<bool> nextendo_sync_profile{linkage, false, "nextendo_sync_profile", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",
+                                           Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "164.132.111.120", "nextendo_nat_ip",
+                                        Category::Network};
+    Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
+                                           Category::Network};
+    // Profiles missing from the NAND whose Nextendo sign-ins the user chose to keep, comma-separated.
+    Setting<std::string> nextendo_kept_accounts{linkage, std::string(), "nextendo_kept_accounts",
+                                                Category::Network};
+    // Host redirect to a server the user runs (core/internal_network/local_redirect.h). Off: the
+    // online_redirect_* values are ignored.
+    Setting<bool> online_service_redirect{linkage, false, "online_service_redirect",
+                                          Category::Network};
+    Setting<std::string> online_redirect_hosts{linkage, std::string(), "online_redirect_hosts",
+                                               Category::Network};
+    Setting<std::string> online_redirect_server{linkage, std::string(), "online_redirect_server",
+                                                Category::Network};
+    Setting<std::string> online_redirect_ca{linkage, std::string(), "online_redirect_ca",
+                                            Category::Network};
+    Setting<bool> online_redirect_loopback_only{linkage, false, "online_redirect_loopback_only",
+                                                Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
@@ -1004,10 +1150,31 @@ struct Values {
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
+    /// A title that reads GPU-written memory on the CPU needs reactive flushing whatever the
+    /// setting says. Set per boot by the game overrides; the settings dialog never touches it.
+    bool force_reactive_flushing{};
+    /// A title that breaks when buffers miss the GPU engines' inner writes keeps those
+    /// invalidations whatever skip_cpu_inner_invalidation says. Set per boot by the game overrides.
+    bool keep_cpu_inner_invalidation{};
 
 };
 
 extern Values values;
+
+struct NvidiaDlssRuntimeSettings {
+    NvidiaDlssQuality quality;
+    NvidiaDlssPreset preset;
+};
+
+void RefreshNvidiaDlssRuntimeSettings();
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
+
+/// The NVIDIA DLSS quality whose render scale Ocarina of Time's built-in patch applies when the
+/// game starts: Balanced, Performance or Ultra Performance with NVIDIA DLSS on, docked.
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
+/// The quality whose render-scale patch the running game's main module got (none: unpatched).
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
@@ -1031,7 +1198,7 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
-void SetNceEnabled(bool is_64bit);
+void SetNceEnabled(bool enabled);
 bool IsNceEnabled();
 
 void SetCurrentProgramID(u64 program_id);
@@ -1040,6 +1207,11 @@ u64 GetCurrentProgramID();
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
+
+/// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
+/// that requires it.
+bool ReactiveFlushing();
+bool SkipCpuInnerInvalidation();
 
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.

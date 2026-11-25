@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -40,6 +39,9 @@ bool VectorVfsFile::IsReadable() const {
 }
 
 std::size_t VectorVfsFile::Read(u8* data_, std::size_t length, std::size_t offset) const {
+    if (offset >= data.size()) {
+        return 0;
+    }
     const auto read = (std::min)(length, data.size() - offset);
     std::memcpy(data_, data.data() + offset, read);
     return read;

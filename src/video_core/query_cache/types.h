@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -11,6 +10,8 @@ namespace VideoCommon {
 enum class QueryPropertiesFlags : u32 {
     HasTimeout = 1 << 0,
     IsAFence = 1 << 1,
+    // The puller's copy of a Switch 2 second-page release into the first page (nx2.h).
+    Nx2Mirror = 1 << 2,
 };
 DECLARE_ENUM_FLAG_OPERATORS(QueryPropertiesFlags)
 

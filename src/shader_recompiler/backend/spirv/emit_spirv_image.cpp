@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/static_vector.hpp>
@@ -357,7 +356,6 @@ Id Emit(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx
     const Id sample{(ctx.*sparse_ptr)(struct_type, std::forward<Args>(args)...)};
     const Id resident_code{ctx.OpCompositeExtract(ctx.U32[1], sample, 0U)};
     sparse->SetDefinition(ctx.OpImageSparseTexelsResident(ctx.U1, resident_code));
-    sparse->Invalidate();
     Decorate(ctx, inst, sample);
     return ctx.OpCompositeExtract(result_type, sample, 1U);
 }

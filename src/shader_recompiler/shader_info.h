@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -15,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/type.h"
+#include "shader_recompiler/storage_write_extent.h"
 #include "shader_recompiler/varying_state.h"
 
 #include <boost/container/small_vector.hpp>
@@ -178,6 +178,8 @@ struct StorageBufferDescriptor {
     /// When set, the buffer pointer is read from memory at this offset from the constant buffer
     /// pointer, which is bound as its own descriptor.
     u32 indirect_offset{~0U};
+    /// How far the program's stores reach past the pointer (unbounded unless proven)
+    StorageWriteExtent write_extent{};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
@@ -232,8 +234,16 @@ struct TextureDescriptor {
     u32 count;
     u32 size_shift;
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
-    /// storage buffer), ~0 when it is the constant buffer word above.
+    /// storage buffer), ~0 when it is the constant buffer word above. With a count above 1 the
+    /// program computes the handle of each element (HandleOp::Index): a handle the shader reads
+    /// from a table at an index only each invocation knows, the shader indexing the array.
     u32 handle_program{~0U};
+    /// Whether the shader indexes the descriptor: an array, whose count the descriptor limits set
+    /// (LimitSampledTextureArrays). It stays one when they cut it to a single element.
+    bool is_descriptor_array{};
+    /// Whether the constant buffer word above reaches the handle only as the address of a load:
+    /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
+    bool handle_is_pointer_word{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -315,6 +325,9 @@ struct Info {
     bool stores_tess_level_inner{};
 
     bool stores_indexed_attributes{};
+    /// The vertex shader stores one value to position z and w, putting every vertex on viewport
+    /// 0's far plane (z / w = 1), the usual way to draw a sky
+    bool position_on_far_plane{};
 
     bool stores_global_memory{};
     bool uses_local_memory{};
@@ -333,6 +346,11 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
+    /// Set when a barrier in divergent control flow lost its execution barrier, see
+    /// ConditionalBarrierPass.
+    bool demoted_conditional_barrier{};
+    /// Set when ConditionalBarrierPass made barriers wait only while the workgroup's branches agree
+    bool uses_barrier_vote{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     bool uses_derivatives{};
@@ -356,6 +374,10 @@ struct Info {
     bool uses_global_memory{};
     bool requires_coherent_global_memory{};
     bool requires_coherent_image_memory{};
+    /// A texture descriptor's handle word is a pointer the program doesn't bind as a storage
+    /// buffer: the capture saw that pointer null or unmapped, and a capture with it mapped
+    /// translates differently (a handle table instead of the word)
+    bool binds_unmapped_pointer_word{};
     /// Set by the SPIR-V backend when HMMA runs on cooperative matrices, which need full subgroups
     bool uses_cooperative_matrix{};
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
@@ -391,6 +413,8 @@ struct Info {
     /// and storage buffer words (see EvaluateHandleProgram), evaluated for each draw.
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
+
+    bool operator==(const Info&) const = default;
 };
 
 template <typename Descriptors>
@@ -417,13 +441,15 @@ enum class HandleOp : u32 {
     Select, ///< condition, true value, false value
     Tee,    ///< slot: keeps the top value in the slot (shared subexpressions)
     Load,   ///< slot: the value kept there
+    Index,  ///< the element of the descriptor array being computed (see TextureDescriptor)
 };
 
 /// Runs a handle program; read_cbuf(index, offset) and read_storage(binding, offset) return the
-/// words it reads. Returns nothing for a malformed program.
+/// words it reads, and element is the descriptor array element computed (HandleOp::Index).
+/// Returns nothing for a malformed program.
 template <typename ReadCbuf, typename ReadStorage>
 std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& read_cbuf,
-                                         ReadStorage&& read_storage) {
+                                         ReadStorage&& read_storage, u32 element = 0) {
     std::array<u32, 64> stack{};
     std::array<u32, 256> slots{};
     size_t size = 0;
@@ -466,6 +492,10 @@ std::optional<u32> EvaluateHandleProgram(std::span<const u32> code, ReadCbuf&& r
         if (op == HandleOp::Load) {
             const u32 slot = operand();
             push(slot < slots.size() ? slots[slot] : 0U);
+            continue;
+        }
+        if (op == HandleOp::Index) {
+            push(element);
             continue;
         }
         if (op == HandleOp::Select) {
