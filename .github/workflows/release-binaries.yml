@@ -113,12 +113,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fork: the Windows PGO build only (lichii-windows.profdata, trained on Ocarina of Time;
-          # see docs/CI.md).
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          # Linux x86-64 PGO builds the same programs with clang against the repo's
+          # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
+          # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
+          # about the same speed. Both Windows builds are clang-cl with ThinLTO; windows-x86_64-pgo
+          # adds lichii-windows.profdata, an MSVC-ABI profile trained on Ocarina of Time (see
+          # docs/CI.md). MSVC still builds for development.
+          - platform: linux-x86_64-pgo
+            runner: ubuntu-24.04
+            pgo: true
+          - platform: windows-x86_64
+            runner: windows-2022
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             profile: lichii-windows.profdata
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-15
 
     steps:
       - name: Check out source
@@ -371,7 +386,7 @@ jobs:
           )
           if [ '${{ matrix.pgo }}' = 'true' ]; then
             # Same flags Eden's CI passes for its clang PGO build.
-            profile="-fprofile-use=$PWD/eglantine.profdata -Wno-backend-plugin \
+            profile="-fprofile-use=$PWD/eglantine.profdata -Wbackend-plugin -Wno-error=backend-plugin \
               -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
             flags+=(
               "-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION"
@@ -391,9 +406,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Fork: CodeView line tables (/Z7 style, sccache-safe) and a PDB, so EDEN_NX2_SAMPLE
-          # reports name functions.
-          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin -gline-tables-only -gcodeview"
+          flags="-DWIN32 -D_WINDOWS -DNOMINMAX -flto=thin"
           if [ -n '${{ matrix.profile }}' ]; then
             flags+=" -fprofile-use=$(cygpath -m "$PWD/${{ matrix.profile }}")"
             flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
@@ -431,8 +444,7 @@ jobs:
             -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
             "-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /OPT:REF /OPT:ICF $lto_cache" \
             "-DCMAKE_C_FLAGS=$flags" \
-            "-DCMAKE_CXX_FLAGS=-EHsc $flags" \
-            "-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /OPT:REF /OPT:ICF"
+            "-DCMAKE_CXX_FLAGS=-EHsc $flags"
 
       - name: Configure macOS
         if: startsWith(matrix.platform, 'macos')
@@ -478,7 +490,28 @@ jobs:
           start=$(date +%s)
           targets="lichii lichii-cmd"
           if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
-          cmake --build build/release --target $targets --parallel
+          if [[ '${{ matrix.pgo }}' == 'true' ]]; then
+            if cmake --build build/release --target $targets --parallel 2>&1 |
+                tee --output-error=warn "$RUNNER_TEMP/pgo-build.log"; then
+              awk -v platform='${{ matrix.platform }}' '
+                /function control flow change detected \(hash mismatch\).* up to [0-9]+ count discarded/ {
+                  total++
+                  if ($0 ~ / up to [1-9][0-9]* count discarded/) nonzero++
+                }
+                END {
+                  printf "### PGO profile mismatches: %s\n\n", platform
+                  printf "- Discarded profile warnings: %d\n- With nonzero counts: %d\n", total, nonzero
+                }
+              ' "$RUNNER_TEMP/pgo-build.log" >> "$GITHUB_STEP_SUMMARY" ||
+                echo "::warning::Could not write PGO mismatch summary"
+            else
+              build_status=${PIPESTATUS[0]}
+              if (( build_status != 0 )); then exit "$build_status"; fi
+              echo "::warning::Could not capture PGO build output for the job summary"
+            fi
+          else
+            cmake --build build/release --target $targets --parallel
+          fi
           ccache --show-stats
           ccache --evict-older-than "$(( $(date +%s) - start + 60 ))s"
           du -sh .ccache .lto-cache 2> /dev/null || true
@@ -761,7 +794,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-      actions: read
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v7
@@ -771,28 +803,12 @@ jobs:
 
       - name: Package release files
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir dist
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
           strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          # When the pattern matches a single artifact (a run that builds one platform),
-          # download-artifact unpacks it straight into artifacts/ instead of a folder named after
-          # it, and the loop below would zip its subfolders one by one. Put it back in its folder.
-          if ! compgen -G "artifacts/lichii-*-${GITHUB_SHA}/" > /dev/null; then
-            names=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
-              --jq ".artifacts[].name | select(startswith(\"lichii-\") and endswith(\"-${GITHUB_SHA}\"))")
-            if [[ $(wc -l <<< "$names") -ne 1 || -z "$names" ]]; then
-              echo "Expected one artifact folder per platform, found: ${names:-none}"
-              exit 1
-            fi
-            staging=$(mktemp -d)
-            mv artifacts/* "$staging"/
-            mv "$staging" "artifacts/${names}"
-          fi
           for artifact in artifacts/*/; do
             name=$(basename "$artifact")
             if compgen -G "$artifact*.AppImage" > /dev/null; then
@@ -859,9 +875,11 @@ jobs:
 
           Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
 
+          Linux ARM64 now ships only the standard build. If you use ARM64 PGO, the in-app updater in build 116 or newer offers the standard package of the same type. If no update appears on an older build, download the standard ARM64 package below.
+
           $({
             row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
+            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "" ""
           } | table)
 
           ## Windows
